@@ -96,3 +96,120 @@ def batch_perpendicular_line(
     dist = np.sqrt(np.sum(p_l ** 2, axis=-1))
     p_l = p_l / (dist[:, np.newaxis] + 1.0e-5)
     return p_l, dist
+
+
+class PartsGraphDataset(Dataset):
+    def __init__(self, file_paths,device):
+        # file_paths = "./data/syn_local/refrigerator/scenes/*.npz"
+        data_list = []
+        for f in glob.glob(file_paths):
+            data = np.load(f, allow_pickle=True)
+            mask_start_list = []
+            joint_type_list = []
+            num_joints = int((len(data)-2)/18)
+
+            pc_start = data[f'pc_start_0']
+            adjacency_matrix = data['adj']
+            parts_conne_gt = data['parts_conne_gt']
+
+            for joint in range(num_joints):
+                mask_start = data[f'pc_seg_start_{joint}']
+                mask_start_list.append(mask_start)
+                joint_type = data[f'joint_type_{joint}']
+                joint_type = torch.tensor(joint_type, dtype=torch.float32).to(device)
+                joint_type_list.append(joint_type)
+
+            base_mask = data['pc_seg_start_base']
+            mask_start_list.insert(0, base_mask)
+
+
+            pc_start, mask_start_list = self.downsample_pc_masks(pc_start, mask_start_list)
+
+            bound_max = pc_start.max(0)
+            bound_min = pc_start.min(0)
+            center = (bound_min + bound_max) / 2
+            scale = (bound_max - bound_min).max()
+            pc_start = (pc_start - center) / scale
+
+            
+            adjacency_matrix = torch.tensor(adjacency_matrix, dtype=torch.float32).to(device)
+            parts_conne_gt = torch.tensor(parts_conne_gt, dtype=torch.float32).to(device)
+
+
+            parts_list = []
+            for mask in range(num_joints+1):
+                part = pc_start[mask_start_list[mask]]
+                part = self.downsample_pc_masks(part)
+                part = torch.tensor(part, dtype=torch.float32).to(device)
+                parts_list.append(part)
+
+            pc_start = torch.tensor(pc_start, dtype=torch.float32).to(device)
+
+            data_tuple = (pc_start, parts_list, adjacency_matrix, parts_conne_gt, joint_type_list)
+
+            data_list.append(data_tuple)
+        
+        self.pairs_list = data_list
+
+    def __len__(self):
+        return len(self.pairs_list)
+
+    def __getitem__(self, idx):
+        pairs_of_pcs = self.pairs_list[idx]
+
+        pc_start = pairs_of_pcs[0]
+        parts_list = pairs_of_pcs[1]
+        adjacency_matrix = pairs_of_pcs[2]
+        parts_conne_gt = pairs_of_pcs[3]
+        joint_type_list = pairs_of_pcs[4]
+
+        return pc_start, parts_list, adjacency_matrix, parts_conne_gt, joint_type_list
+    
+    def downsample_pc_masks(self, points, masks_list=None, num_points=1024):
+        """
+        Randomly downsample the point cloud to a fixed size.
+        """
+        N = points.shape[0]
+        if N == 0:
+            points = np.zeros((num_points, 3), dtype=np.float32)
+            N= num_points
+
+        if N >= num_points:
+            np.random.seed(97)
+            indices = np.random.choice(N, num_points, replace=False)
+        else:
+            np.random.seed(97)
+            indices = np.random.choice(N, num_points, replace=True)  # pad if too small
+        if masks_list is not None:
+            for i in range(len(masks_list)):
+                labels = masks_list[i]
+                labels = labels[indices]
+                masks_list[i] = labels
+            return points[indices], masks_list
+        else:
+            return points[indices]
+    
+
+def collate_graphs(batch):
+    """
+    Custom collate_fn for variable-sized graphs.
+    Each element in batch = (pc_start, parts_list, adjacency_matrix).
+    We return lists instead of stacking.
+    """
+    pc_starts = []
+    parts_lists = []
+    adjs = []
+    parts_conne_gt_lst = []
+    
+    for pc_start, parts_list, adj, parts_conne_gt in batch:
+        pc_starts.append(pc_start)         # [N, 3]
+        parts_lists.append(parts_list)     # list of [P_i, 3]
+        adjs.append(adj)                   # [num_parts, num_parts]
+        parts_conne_gt_lst.append(parts_conne_gt)
+
+    return {
+        "pc_start": pc_starts,
+        "parts_list": parts_lists,
+        "adj": adjs,
+        "parts_connections": parts_conne_gt_lst,
+    }
