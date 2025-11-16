@@ -158,21 +158,21 @@ def inference(model, pc_start, pc_target,seg_mask_start,center, scale):
 
     return joint_axis_pred, pivot_point_pred, config_pred
 
-file_paths = "../Ditto/Articulated_object_simulation-main/data/syn_local/microwave_valid/scenes/*.npz"
+file_paths = "../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/refrigerator/scenes/*.npz"
 
 # data load
 data_list = []
 for f in glob.glob(file_paths):
     data = np.load(f, allow_pickle=True)
-    pc_start = data['pc_start']
-    pc_target = data['pc_end']
-    seg_mask_start = data['pc_seg_start']
-    seg_mask_target = data['pc_seg_end']
-    joint_type = data['joint_type']
-    screw_axis = data['screw_axis']
-    screw_moment = data['screw_moment']
-    state_start = data['state_start']
-    state_target = data['state_end']
+    pc_start = data['pc_start_0']
+    pc_target = data['pc_end_0']
+    seg_mask_start = data['pc_seg_start_0']
+    seg_mask_target = data['pc_seg_end_0']
+    joint_type = data['joint_type_0']
+    screw_axis = data['screw_axis_0']
+    screw_moment = data['screw_moment_0']
+    state_start = data['state_start_0']
+    state_target = data['state_end_0']
 
     bound_max = np.maximum(pc_start.max(0), pc_target.max(0))
     bound_min = np.minimum(pc_start.min(0), pc_target.min(0))
@@ -198,7 +198,7 @@ for f in glob.glob(file_paths):
 
 idx = np.random.randint(len(data_list))
 
-pc_start, pc_target,seg_mask_start,_,center,scale,_,_,_,_,_,_,_,pc_start_unsampled,pc_target_unsampled = data_list[2]
+pc_start, pc_target,seg_mask_start,_,center,scale,_,_,_,_,_,_,_,pc_start_unsampled,pc_target_unsampled = data_list[idx]
 
 
 pc_start = torch.from_numpy(pc_start).unsqueeze(0).cuda().float()
@@ -249,11 +249,14 @@ sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.02)
 sphere.paint_uniform_color([0, 0, 0]) 
 sphere.translate(np.asarray(pivot_point_pred)+tr,relative=False)
 
+sphere2 = o3d.geometry.TriangleMesh.create_sphere(radius=0.02)
+sphere2.paint_uniform_color([0, 0, 0]) 
+
 arrow = create_axis_arrow(pivot_point_pred, joint_type_pred, length=0.55,tr=tr)
 
 # mesh = mesh_from_pcd(pcd_target1)
 
-o3d.visualization.draw_geometries([pcd_target,pcd_start, arrow, sphere])
+o3d.visualization.draw_geometries([pcd_target,pcd_start, arrow, sphere, sphere2])
 
 
 

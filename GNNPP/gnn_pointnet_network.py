@@ -150,14 +150,21 @@ class parts_connection_mlp(nn.Module):
             nn.Linear(kwargs["nhidden_mlp"], 1),  # {revolute, prismatic}
         )
 
-        # MLP for parent part classification (binary-classification)
-        self.joint_type_mlp = nn.Sequential(
+        self.revolute_mlp = nn.Sequential(
             nn.Linear(2 * kwargs["out_dim"], kwargs["nhidden_mlp"]),
             nn.Dropout(kwargs["dropout"]),
             nn.ReLU(),
-            nn.Linear(kwargs["nhidden_mlp"], 1),  # {parent, child}
+            nn.Linear(kwargs["nhidden_mlp"], 3),
         )
 
+        self.prismatic_mlp = nn.Sequential(
+            nn.Linear(2 * kwargs["out_dim"], kwargs["nhidden_mlp"]),
+            nn.Dropout(kwargs["dropout"]),
+            nn.ReLU(),
+            nn.Linear(kwargs["nhidden_mlp"], 3),
+        )
+
+                      
     def forward(self, part_pointclouds, adj):
         # Node embeddings
         h = self.pointnetgcn(part_pointclouds, adj)  # [N, out_dim]
@@ -179,7 +186,11 @@ class parts_connection_mlp(nn.Module):
         # Predict joint type (multi-class)
         joint_type_pred = self.joint_type_mlp(edge_feats)  # [num_edges, 1]
 
-        return edge_pred, joint_type_pred, (src, dst)
+        revolute_para_pred = self.revolute_mlp(edge_feats)
+
+        prismatic_para_pred = self.prismatic_mlp(edge_feats)
+
+        return edge_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, (src, dst)
 
     
     

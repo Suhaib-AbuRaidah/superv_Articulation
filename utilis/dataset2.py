@@ -100,24 +100,38 @@ def batch_perpendicular_line(
 
 class PartsGraphDataset(Dataset):
     def __init__(self, file_paths,device):
-        # file_paths = "./data/syn_local/refrigerator/scenes/*.npz"
+        # file_paths = "./data/Shape2Motion_gcn/*/scenes/*.npz"
         data_list = []
-        for f in glob.glob(file_paths):
+        for f in sorted(glob.glob(file_paths)):
             data = np.load(f, allow_pickle=True)
             mask_start_list = []
             joint_type_list = []
-            num_joints = int((len(data)-2)/18)
+            screw_axis_list = []
+            screw_point_list = []
+            num_joints = int((len(data)-4)/18)
 
             pc_start = data[f'pc_start_0']
             adjacency_matrix = data['adj']
             parts_conne_gt = data['parts_conne_gt']
 
+            object_path = str(data['object_path'])
+            
+            if object_path.split('/')[-3] == 'robotic_arm':
+                n = adjacency_matrix.shape[0]
+                i = np.arange(n - 1)
+                adjacency_matrix[i, i + 1] = 1
+
             for joint in range(num_joints):
                 mask_start = data[f'pc_seg_start_{joint}']
                 mask_start_list.append(mask_start)
                 joint_type = data[f'joint_type_{joint}']
-                joint_type = torch.tensor(joint_type, dtype=torch.float32).to(device)
-                joint_type_list.append(joint_type)
+                joint_type_list.append(int(joint_type))
+                screw_axis = data[f'screw_axis_{joint}']
+                screw_moment = data[f'screw_moment_{joint}']
+                screw_point = np.cross(screw_axis, screw_moment)
+                screw_axis_list.append(screw_axis)
+                screw_point_list.append(screw_point)
+
 
             base_mask = data['pc_seg_start_base']
             mask_start_list.insert(0, base_mask)
@@ -131,7 +145,10 @@ class PartsGraphDataset(Dataset):
             scale = (bound_max - bound_min).max()
             pc_start = (pc_start - center) / scale
 
-            
+
+            joints_type = torch.tensor(np.array(joint_type_list), dtype=torch.float32).to(device)
+            joints_screw_axis = torch.tensor(np.array(screw_axis_list), dtype=torch.float32).to(device)
+            joints_screw_point = torch.tensor(np.array(screw_point_list), dtype=torch.float32).to(device)
             adjacency_matrix = torch.tensor(adjacency_matrix, dtype=torch.float32).to(device)
             parts_conne_gt = torch.tensor(parts_conne_gt, dtype=torch.float32).to(device)
 
@@ -145,7 +162,7 @@ class PartsGraphDataset(Dataset):
 
             pc_start = torch.tensor(pc_start, dtype=torch.float32).to(device)
 
-            data_tuple = (pc_start, parts_list, adjacency_matrix, parts_conne_gt, joint_type_list)
+            data_tuple = (pc_start, parts_list, adjacency_matrix, parts_conne_gt, joints_type, joints_screw_axis, joints_screw_point)
 
             data_list.append(data_tuple)
         
@@ -162,8 +179,10 @@ class PartsGraphDataset(Dataset):
         adjacency_matrix = pairs_of_pcs[2]
         parts_conne_gt = pairs_of_pcs[3]
         joint_type_list = pairs_of_pcs[4]
+        screw_axis_list = pairs_of_pcs[5]
+        screw_point_list = pairs_of_pcs[6]
 
-        return pc_start, parts_list, adjacency_matrix, parts_conne_gt, joint_type_list
+        return pc_start, parts_list, adjacency_matrix, parts_conne_gt, joint_type_list, screw_axis_list, screw_point_list
     
     def downsample_pc_masks(self, points, masks_list=None, num_points=1024):
         """
