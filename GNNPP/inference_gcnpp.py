@@ -243,4 +243,6 @@ print(adj_pred)
 
 pcd = masked_pc(pc_start, mask_start_list)
 img = pc_to_img(pcd)
+adj_pred = np.array([[0,1,0,0],[1,0,1,0],[0,1,0,1],[0,0,1,0]])
+adj_pred = torch.tensor(adj_pred, dtype=torch.float32).cuda()
 visualize_articulated_graph(adj_pred,adj,joint_type_pred_valid, axes_pred,img)
