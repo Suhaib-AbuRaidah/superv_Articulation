@@ -4,9 +4,9 @@ import numpy as np
 # Example structure
 category_metrics = {
     "Robotic Arm": {
-        "acc": 0.94, "prec": 0.98, "recall": 0.89, "f1": 0.92,
+        "acc": 0.91, "prec": 0.95, "recall": 0.91, "f1": 0.93,
         "acc_": 1.0, "f1_": 1.0,
-        "revolute_cosine": 0.91, "angle_err_deg_r": 17.5,
+        "revolute_cosine": 0.91, "angle_err_deg_r": 11.03,
         "prismatic_cosine": 0, "angle_err_deg_p": 0
     },
     # # Add more categories to test color variation

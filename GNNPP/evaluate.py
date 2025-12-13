@@ -1,272 +1,329 @@
-import numpy as np
 import torch
+import torch.nn.functional as F
+import numpy as np
+import os
 import sys
 sys.path.append('/home/suhaib/superv_Articulation')
+
+from utilis.dataset2 import PartsGraphDataset2
 from GNNPP.gnn_pointnet_network import parts_connection_mlp
-import glob
-import torch.nn.functional as F
-from utilis.Inference_graph import visualize_articulated_graph
-import open3d as o3d
-import matplotlib.pyplot as plt
-import copy
+from torch.utils.data import DataLoader
 
-def downsample_pc_masks( points, masks_list1=None, num_points=1024):
+# ------------------------------------------------------------
+# Utility helpers
+# ------------------------------------------------------------
+def mean_or_zero(x):
+    if len(x) == 0:
+        return 0.0
+    return float(np.mean(x))
+
+def binarize(logits, thr=0.5):
+    return (torch.sigmoid(logits) > thr).float()
+
+def cosine_similarity_vec(a, b):
+    return torch.sum(a * b, dim=1)
+
+def angular_err_deg(a, b):
+    cos_sim = cosine_similarity_vec(a, b).clamp(-1+1e-7, 1-1e-7)
+    return torch.rad2deg(torch.acos(cos_sim))
+
+def _empty_metrics_dict():
+    return {
+        "conn_acc": 0.0,
+        "conn_prec": 0.0,
+        "conn_rec": 0.0,
+        "conn_f1": 0.0,
+        "joint_acc": 0.0,
+        "joint_f1": 0.0,
+        "revolute_cos": [],
+        "revolute_ang": [],
+        "prismatic_cos": [],
+        "prismatic_ang": [],
+    }
+
+def _empty_metrics_with_conn(conn_acc, p, r, f1):
+    m = _empty_metrics_dict()
+    m["conn_acc"] = conn_acc
+    m["conn_prec"] = p
+    m["conn_rec"] = r
+    m["conn_f1"] = f1
+    return m
+
+# ------------------------------------------------------------
+# Evaluation step for a single sample
+# ------------------------------------------------------------
+def eval_step(model, data_dict, verbose=False, skip_invalid=True):
     """
-    Randomly downsample the point cloud to a fixed size.
+    Returns dict as before. If an indexing problem occurs, either skip the sample
+    (skip_invalid=True) and return zeros/empty lists, or raise an informative error.
     """
-    N = points.shape[0]
-    if N == 0:
-        points = np.zeros((num_points, 3), dtype=np.float32)
-        N= num_points
+    (
+        pc_starts,
+        parts_start_list,
+        pc_ends,
+        parts_end_list,
+        adj,
+        parts_connections_gt,
+        joint_type_list_gt,
+        screw_axis_list_gt,
+        screw_point_list_gt,
+        angles,
+        file_name,
+    ) = data_dict
 
-    if N >= num_points:
-        np.random.seed(97)
-        indices = np.random.choice(N, num_points, replace=False)
-    else:
-        np.random.seed(97)
-        indices = np.random.choice(N, num_points, replace=True)  # pad if too small
+    adj = adj.squeeze()
+    # print(f"\n\nAdjacency Matrix:\n{adj}\n\n")
+    parts_connections_gt = parts_connections_gt.squeeze()
+    # print(f"Parts Connections GT:\n{parts_connections_gt}\n\n")
+    screw_axis_list_gt = screw_axis_list_gt.squeeze().view(-1,3)
+    screw_axis_list_gt = torch.abs(screw_axis_list_gt)
+    screw_axis_list_gt = F.normalize(screw_axis_list_gt, dim=1)
+    screw_point_list_gt = screw_point_list_gt.squeeze().view(-1,3)
+
+    joint_type_list_gt = joint_type_list_gt.squeeze()
+    angles = angles.squeeze().view(-1,1)
     
-    if masks_list1 is not None:
-        masks_list = copy.deepcopy(masks_list1)
-        for i in range(len(masks_list)):
-            labels = masks_list[i]
-            labels = labels[indices]
-            masks_list[i] = labels
-        return points[indices], masks_list
-    else:
-        return points[indices]
-    
-def pc_to_img(pcd, width=600, height=600, 
-              fov=45.0, 
-              camera_distance=1.5, 
-              elevation_deg=10, 
-              azimuth_deg=35):
-    renderer = o3d.visualization.rendering.OffscreenRenderer(width, height)
+    # ensure device consistent
+    device = next(model.parameters()).device
 
-    mat = o3d.visualization.rendering.MaterialRecord()
-    mat.shader = "defaultUnlit"
-    renderer.scene.add_geometry("pcd", pcd, mat)
+    # move GT tensors to same device (they may already be)
+    parts_connections_gt = parts_connections_gt.squeeze().to(device)
+    joint_type_list_gt = joint_type_list_gt.squeeze().to(device)
+    screw_axis_list_gt = screw_axis_list_gt.squeeze().to(device)
 
-    bounds = pcd.get_axis_aligned_bounding_box()
-    center = bounds.get_center()
-    extent = np.max(bounds.get_extent())
+    # model forward (keep in eval mode; caller should have set it)
+    edges_conne_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, z, (src, dst) = \
+        model(parts_start_list, parts_end_list, adj)
 
-    # Convert spherical coordinates to cartesian for camera placement
-    elev_rad = np.deg2rad(elevation_deg)
-    azim_rad = np.deg2rad(azimuth_deg)
+    # ensure src/dst are LongTensor on correct device
+    src = src.to(device).long()
+    dst = dst.to(device).long()
 
-    cam_pos = center + camera_distance * extent * np.array([
-        np.cos(elev_rad) * np.cos(azim_rad),
-        np.sin(elev_rad),
-        np.cos(elev_rad) * np.sin(azim_rad)
-    ])
+    # Quick sanity checks
+    if src.numel() != dst.numel():
+        msg = f"src ({src.numel()}) != dst ({dst.numel()})"
+        if verbose: print("INDEX ERROR:", msg, "file:", file_name)
+        if skip_invalid:
+            return _empty_metrics_dict()
+        raise IndexError(msg)
 
-    renderer.setup_camera(fov, center, cam_pos, [0, 0, 1])
+    # shape expectations
+    n_nodes = parts_connections_gt.shape[0]  # adjacency matrix is [N,N]
+    max_idx = int(max(int(src.max().item()), int(dst.max().item()))) if src.numel() > 0 else -1
+    min_idx = int(min(int(src.min().item()), int(dst.min().item()))) if src.numel() > 0 else 0
 
-    img_o3d = renderer.render_to_image()
-    img = np.asarray(img_o3d)
-    # plt.imshow(img)
-    # plt.show()
-    return img
+    # If indexing out of bounds, log and optionally skip
+    if src.numel() == 0:
+        if verbose: print("No edges predicted for file:", file_name)
+        return _empty_metrics_dict()
+
+    if min_idx < 0 or max_idx >= n_nodes:
+        if verbose:
+            print("Index out of bounds detected for file:", file_name)
+            print(f"nodes in GT adjacency: {n_nodes}, src_min:{min_idx}, src_max:{max_idx}")
+            print("src sample:", src)
+            print("dst sample:", dst)
+        if skip_invalid:
+            return _empty_metrics_dict()
+        raise IndexError(f"Index out of bounds: nodes={n_nodes}, src_max={max_idx}, src_min={min_idx}")
+
+    # Now safe to index
+    conn_gt = parts_connections_gt[src, dst].float().unsqueeze(1)  # [E_model,1]
+
+    # connection metrics
+    conn_pred_lbl = binarize(edges_conne_pred)
+    tp = ((conn_pred_lbl == 1) & (conn_gt == 1)).sum().item()
+    fp = ((conn_pred_lbl == 1) & (conn_gt == 0)).sum().item()
+    fn = ((conn_pred_lbl == 0) & (conn_gt == 1)).sum().item()
+    tn = ((conn_pred_lbl == 0) & (conn_gt == 0)).sum().item()
+
+    conn_acc = (tp + tn) / max(tp + tn + fp + fn, 1)
+    conn_prec = tp / max(tp + fp, 1)
+    conn_rec = tp / max(tp + fn, 1)
+    conn_f1 = 2 * conn_prec * conn_rec / max(conn_prec + conn_rec, 1e-12)
+
+    # joint mask (edges that actually exist in GT)
+    joint_mask = conn_gt.squeeze(1) > 0
+
+    # Align joint_type_list_gt by (src,dst) then mask
+    jt_gt_edges = joint_type_list_gt[src, dst].view(-1, 1).to(device)  # [E_model,1]
+    jt_pred_edges = joint_type_pred.view(-1, 1)  # logits aligned with model edges
+
+    joint_acc = 0.0
+    joint_f1 = 0.0
+    if joint_mask.sum() > 0:
+        jt_pred_valid = binarize(jt_pred_edges[joint_mask])
+        jt_gt_valid = jt_gt_edges[joint_mask].float()
+
+        tp2 = ((jt_pred_valid == 1) & (jt_gt_valid == 1)).sum().item()
+        fp2 = ((jt_pred_valid == 1) & (jt_gt_valid == 0)).sum().item()
+        fn2 = ((jt_pred_valid == 0) & (jt_gt_valid == 1)).sum().item()
+        tn2 = ((jt_pred_valid == 0) & (jt_gt_valid == 0)).sum().item()
+
+        joint_acc = (tp2 + tn2) / max(tp2 + tn2 + fp2 + fn2, 1)
+        prec2 = tp2 / max(tp2 + fp2, 1)
+        rec2 = tp2 / max(tp2 + fn2, 1)
+        joint_f1 = 2 * prec2 * rec2 / max(prec2 + rec2, 1e-12)
+
+    # Axis metrics
+    # prepare GT axes aligned by edges
+    # screw_axis_list_gt is [N_nodes, 3] or [E_gt,3]? If you used adjacency indexing, it's [N_nodes,3] and jt_gt_edges indexing will produce per-edge axis.
+    try:
+        axis_gt_edges = screw_axis_list_gt[src, dst].view(-1, 3).to(device)
+    except Exception:
+        # fallback: if screw_axis_list_gt is [E_gt,3] already, try indexing directly by edge index if sizes match
+        if screw_axis_list_gt.shape[0] == jt_gt_edges.shape[0]:
+            axis_gt_edges = screw_axis_list_gt.view(-1, 3).to(device)
+        else:
+            if verbose: print("Unable to align screw_axis_list_gt by (src,dst) for file:", file_name)
+            return _empty_metrics_with_conn(conn_acc, conn_prec, conn_rec, conn_f1)
+
+    axis_gt_edges = axis_gt_edges.abs()
+    axis_gt_edges = F.normalize(axis_gt_edges, dim=1)
+
+    # predicted axes for valid edges
+    rev_pred_axes = F.normalize(revolute_para_pred.view(-1, 3)[joint_mask], dim=1) if revolute_para_pred.numel() > 0 else torch.empty((0,3), device=device)
+    pri_pred_axes = F.normalize(prismatic_para_pred.view(-1, 3)[joint_mask], dim=1) if prismatic_para_pred.numel() > 0 else torch.empty((0,3), device=device)
+
+    # determine joint type per-edge (GT) to split between revolute/prismatic
+    jt_gt_edges_flat = jt_gt_edges.view(-1)
+    revolute_mask = joint_mask & (jt_gt_edges_flat == 0)
+    prismatic_mask = joint_mask & (jt_gt_edges_flat == 1)
+
+    revolute_cos, revolute_ang, prismatic_cos, prismatic_ang = [], [], [], []
+
+    # revolute: choose predicted axes from rev_pred_axes aligned with revolute_mask
+    if revolute_mask.sum() > 0 and rev_pred_axes.numel() > 0:
+        # Need to align indices: rev_pred_axes is revolute predictions only for joint_mask True
+        # create index positions of joint_mask True
+        valid_idx = torch.nonzero(joint_mask, as_tuple=False).view(-1)
+        rev_idx_in_valid = torch.nonzero(revolute_mask, as_tuple=False).view(-1)
+        # map to positions inside rev_pred_axes
+        rev_positions = (revolute_mask.nonzero(as_tuple=False).view(-1) - valid_idx[0] + 0) if False else None
+        # simpler: use boolean selection with same size
+        gt_rev = axis_gt_edges[revolute_mask[joint_mask]]
+        pred_rev = rev_pred_axes[revolute_mask[joint_mask]]
+        if pred_rev.shape[0] == gt_rev.shape[0]:
+            c = cosine_similarity_vec(pred_rev, gt_rev).cpu().numpy()
+            a = angular_err_deg(pred_rev, gt_rev).cpu().numpy()
+            revolute_cos.extend(c.tolist())
+            revolute_ang.extend(a.tolist())
+        else:
+            # best effort: iterate pairs (safe)
+            min_len = min(pred_rev.shape[0], gt_rev.shape[0])
+            if min_len > 0:
+                c = cosine_similarity_vec(pred_rev[:min_len], gt_rev[:min_len]).cpu().numpy()
+                a = angular_err_deg(pred_rev[:min_len], gt_rev[:min_len]).cpu().numpy()
+                revolute_cos.extend(c.tolist())
+                revolute_ang.extend(a.tolist())
+
+    # prismatic
+    if prismatic_mask.sum() > 0 and pri_pred_axes.numel() > 0:
+        gt_pri = axis_gt_edges[prismatic_mask[joint_mask]]
+        pred_pri = pri_pred_axes[prismatic_mask[joint_mask]]
+        if pred_pri.shape[0] == gt_pri.shape[0]:
+            c = cosine_similarity_vec(pred_pri, gt_pri).cpu().numpy()
+            a = angular_err_deg(pred_pri, gt_pri).cpu().numpy()
+            prismatic_cos.extend(c.tolist())
+            prismatic_ang.extend(a.tolist())
+        else:
+            min_len = min(pred_pri.shape[0], gt_pri.shape[0])
+            if min_len > 0:
+                c = cosine_similarity_vec(pred_pri[:min_len], gt_pri[:min_len]).cpu().numpy()
+                a = angular_err_deg(pred_pri[:min_len], gt_pri[:min_len]).cpu().numpy()
+                prismatic_cos.extend(c.tolist())
+                prismatic_ang.extend(a.tolist())
+
+    return {
+        "conn_acc": conn_acc,
+        "conn_prec": conn_prec,
+        "conn_rec": conn_rec,
+        "conn_f1": conn_f1,
+        "joint_acc": joint_acc,
+        "joint_f1": joint_f1,
+        "revolute_cos": revolute_cos,
+        "revolute_ang": revolute_ang,
+        "prismatic_cos": prismatic_cos,
+        "prismatic_ang": prismatic_ang,
+    }
 
 
-def masked_pc(pc, masks_list):
-    num_joints = len(masks_list)
-    pcd_start = o3d.geometry.PointCloud()
-    pcd_start.points = o3d.utility.Vector3dVector(pc)
-    color = np.zeros_like(pc)
-    # color = create_color_array_grouped(pc_start_list[0].shape[0])
-    for i in range(num_joints):
-        if i==0:
-            color[masks_list[i]] = np.array([1, 0, 0])
-        elif i==1:
-            color[masks_list[i]] = np.array([0, 1, 0])
-        elif i==2:
-            color[masks_list[i]] = np.array([0, 0, 1])
-        elif i==3:
-            color[masks_list[i]] = np.array([1, 1, 0])
-        elif i==4:
-            color[masks_list[i]] = np.array([1, 0, 1])
-        elif i==5:
-            color[masks_list[i]] = np.array([0, 1, 1])
-        elif i==6:
-            color[masks_list[i]] = np.array([0.5, 0.5, 0.5])
+# ------------------------------------------------------------
+# Main evaluation
+# ------------------------------------------------------------
+def evaluate(checkpoint_path):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    pcd_start.colors = o3d.utility.Vector3dVector(color)
-    pcd_start.colors = o3d.utility.Vector3dVector(color)
-    # o3d.visualization.draw_geometries([pcd_start])
-    return pcd_start
+    dataset = PartsGraphDataset2(
+        "../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/robotic_arm_testing/scenes/*.npz",
+        device
+    )
+    val_loader = DataLoader(dataset, batch_size=1, shuffle=False)
 
+    # Load model
+    params = {
+        "pointnet_dim": 1024,
+        "nlayers": 4,
+        "nhidden": 256,
+        "out_dim": 128,
+        "dropout": 0.3,
+        "lamda": 0.5,
+        "alpha": 0.1,
+        "variant": True,
+        "nhidden_mlp": 128,
+        "n_class": 1,
+        "latent_dim": 1,
+        "decoder_out_dim": 128,
+    }
 
-def joint_pred_to_matrix(joint_type_pred, src, dst,num_joints):
-    parts_conne = torch.zeros((num_joints, num_joints))
-    for i in range(joint_type_pred.shape[0]):
-        if joint_type_pred[i] > 0:
-            parts_conne[src[i], dst[i]] = 1
-            parts_conne[dst[i], src[i]] = 1
-    return parts_conne
+    model = parts_connection_mlp(**params).to(device)
+    model.load_state_dict(torch.load(checkpoint_path))
+    model.eval()
 
-
-file_paths = "../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/robotic_arm/scenes/*.npz"
-data_list = []
-for f in glob.glob(file_paths):
-        data = np.load(f, allow_pickle=True)
-        mask_start_list = []
-        joint_type_list = []
-        screw_axis_list = []
-        screw_point_list = []
-        num_joints = int((len(data)-2)/18)
-
-        pc_start = data[f'pc_start_0']
-        adjacency_matrix = data['adj']
-        parts_conne_gt = data['parts_conne_gt']
-
-        object_path = str(data['object_path'])
-        
-        if object_path.split('/')[-3] == 'robotic_arm':
-            n = adjacency_matrix.shape[0]
-            i = np.arange(n - 1)
-            adjacency_matrix[i, i + 1] = 1      
-
-        for joint in range(num_joints):
-            mask_start = data[f'pc_seg_start_{joint}']
-            mask_start_list.append(mask_start)
-            joint_type = data[f'joint_type_{joint}']
-            joint_type_list.append(int(joint_type))
-            screw_axis = data[f'screw_axis_{joint}']
-            screw_axis_list.append(screw_axis)
-
-
-        base_mask = data['pc_seg_start_base']
-        mask_start_list.insert(0, base_mask)
-
-
-        pc_start_ds, mask_start_list_ds = downsample_pc_masks(pc_start, mask_start_list)
-        bound_max = pc_start_ds.max(0)
-        bound_min = pc_start_ds.min(0)
-        center = (bound_min + bound_max) / 2
-        scale = (bound_max - bound_min).max()
-        pc_start_ds = (pc_start_ds - center) / scale
-
-        
-        adjacency_matrix = torch.tensor(adjacency_matrix, dtype=torch.float32).cuda()
-        parts_conne_gt = torch.tensor(parts_conne_gt, dtype=torch.float32).cuda()
-
-        parts_list = []
-        for mask in range(num_joints+1):
-            part = pc_start_ds[mask_start_list_ds[mask]]
-            part = downsample_pc_masks(part)
-            part = torch.tensor(part, dtype=torch.float32).cuda().unsqueeze(0)
-            parts_list.append(part)
-
-        pc_start_ds = torch.tensor(pc_start_ds, dtype=torch.float32).cuda()
-        joints_type = torch.tensor(np.array(joint_type_list), dtype=torch.float32).cuda()
-        joints_screw_axis = torch.abs(torch.tensor(np.array(screw_axis_list), dtype=torch.float32).cuda())
-        data_tuple = (pc_start_ds, parts_list, adjacency_matrix, parts_conne_gt, joints_type, joints_screw_axis, pc_start,mask_start_list,screw_point_list)
-
-        data_list.append(data_tuple)
-
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-
-# Model setup
-params = {
-    "pointnet_dim": 1024,
-    "nlayers": 4,
-    "nhidden": 256,
-    "out_dim": 128,
-    "dropout": 0.3,
-    "lamda": 0.5,
-    "alpha": 0.1,
-    "variant": True,
-    "nhidden_mlp": 128,
-    "n_class": 1,
-}
-
-weights_path = "/home/suhaib/superv_Articulation/pre_trained_models_gcnpp/2025-11-03 23:15:17_mix/chkpt_best_model_val.pth"
-model = parts_connection_mlp(**params).cuda()
-model.load_state_dict(torch.load(weights_path))
-model.eval()
-
-# Containers for metrics
-conn_acc, conn_prec, conn_rec, conn_f1 = [], [], [], []
-joint_acc, joint_f1 = [], []
-revolute_cos, revolute_ang, prismatic_cos, prismatic_ang = [], [], [], []
-
-for idx, data in enumerate(data_list):
-    pc_start_ds, parts_list, adj, parts_conne_gt, joints_type, joints_screw_axis, pc_start, mask_start_list, joints_screw_point = data
-
-    adj = adj.squeeze(0)
-    parts_connections = parts_conne_gt.squeeze(0)
+    # Accumulators
+    all_conn_acc = []
+    all_conn_prec = []
+    all_conn_rec = []
+    all_conn_f1 = []
+    all_joint_acc = []
+    all_joint_f1 = []
+    all_revolute_cos = []
+    all_revolute_ang = []
+    all_prismatic_cos = []
+    all_prismatic_ang = []
 
     with torch.no_grad():
-        edges_conne_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, (src, dst) = model(parts_list, adj)
+        for data in val_loader:
+            metrics = eval_step(model, data)
 
-    # ----- Connection prediction -----
-    edges_conne_pred_bin = (torch.sigmoid(edges_conne_pred) > 0.5).float()
-    conn_true = parts_conne_gt[src, dst].float().cpu().numpy()
-    conn_pred = edges_conne_pred_bin.cpu().numpy()
+            all_conn_acc.append(metrics["conn_acc"])
+            all_conn_prec.append(metrics["conn_prec"])
+            all_conn_rec.append(metrics["conn_rec"])
+            all_conn_f1.append(metrics["conn_f1"])
+            all_joint_acc.append(metrics["joint_acc"])
+            all_joint_f1.append(metrics["joint_f1"])
+            all_revolute_cos.extend(metrics["revolute_cos"])
+            all_revolute_ang.extend(metrics["revolute_ang"])
+            all_prismatic_cos.extend(metrics["prismatic_cos"])
+            all_prismatic_ang.extend(metrics["prismatic_ang"])
 
-    # if len(np.unique(conn_true)) > 1:  # avoid metrics crash when all labels are same
-    conn_acc.append(accuracy_score(conn_true, conn_pred))
-    conn_prec.append(precision_score(conn_true, conn_pred))
-    conn_rec.append(recall_score(conn_true, conn_pred))
-    conn_f1.append(f1_score(conn_true, conn_pred))
+    final_metrics = {
+        "conn_acc": mean_or_zero(all_conn_acc),
+        "conn_prec": mean_or_zero(all_conn_prec),
+        "conn_rec": mean_or_zero(all_conn_rec),
+        "conn_f1": mean_or_zero(all_conn_f1),
+        "joint_type_acc": mean_or_zero(all_joint_acc),
+        "joint_type_f1": mean_or_zero(all_joint_f1),
+        "revolute_cosine": mean_or_zero(all_revolute_cos),
+        "revolute_angle_err_deg": mean_or_zero(all_revolute_ang),
+        "prismatic_cosine": mean_or_zero(all_prismatic_cos),
+        "prismatic_angle_err_deg": mean_or_zero(all_prismatic_ang),
+    }
 
-    # ----- Joint type prediction -----
-    joint_mask = parts_conne_gt[src, dst].float().unsqueeze(1) > 0
-    joint_mask = joint_mask.squeeze()
-    if joint_mask.sum() == 0:
-        continue
+    return final_metrics
 
-    joint_type_pred_valid = (torch.sigmoid(joint_type_pred[joint_mask]) > 0.5).float()
-    joint_true = joints_type.float().cpu().numpy()
-    joint_pred = joint_type_pred_valid.cpu().numpy()
 
-    # print(f"Joint True: {joint_true}, Joint Pred: {joint_pred}")
-    # if len(np.unique(joint_true)) > 1:
-    joint_acc.append(accuracy_score(joint_true, joint_pred))
-    joint_f1.append(f1_score(joint_true, joint_pred, average='macro', zero_division=1))
-
-    # ----- Revolute and prismatic parameters -----
-    revolute_mask = (joint_type_pred_valid == 0).squeeze()
-    prismatic_mask = (joint_type_pred_valid == 1).squeeze()
-
-    if revolute_mask.sum() > 0:
-        rev_pred = revolute_para_pred[:, :3][joint_mask][revolute_mask].view(-1, 3)
-        rev_pred = F.normalize(rev_pred, dim=1)
-        # print(f"Revolute Axis Prediction: {rev_pred}\n")
-        rev_gt = joints_screw_axis[revolute_mask].view(-1, 3)
-        # print(f"Revolute Axis GT: {rev_gt}\n")
-        cos_sim = F.cosine_similarity(rev_pred, rev_gt, dim=1)
-        ang_err = torch.acos(torch.clamp(cos_sim, -1, 1)) * 180 / torch.pi
-        revolute_cos.append(cos_sim.mean().item())
-        revolute_ang.append(ang_err.mean().item())
-
-    if prismatic_mask.sum() > 0:
-        pri_pred = prismatic_para_pred[joint_mask][prismatic_mask].view(-1, 3)
-        pri_pred = F.normalize(pri_pred, dim=1)
-        pri_gt = joints_screw_axis[prismatic_mask].view(-1, 3)
-        cos_sim = F.cosine_similarity(pri_pred, pri_gt, dim=1)
-        ang_err = torch.acos(torch.clamp(cos_sim, -1, 1)) * 180 / torch.pi
-        prismatic_cos.append(cos_sim.mean().item())
-        prismatic_ang.append(ang_err.mean().item())
-
-# ----- Summary -----
-def mean_or_zero(lst): return np.mean(lst) if len(lst) > 0 else 0
-
-metrics = {
-    "conn_acc": mean_or_zero(conn_acc),
-    "conn_prec": mean_or_zero(conn_prec),
-    "conn_rec": mean_or_zero(conn_rec),
-    "conn_f1": mean_or_zero(conn_f1),
-    "joint_type_acc": mean_or_zero(joint_acc),
-    "joint_type_f1": mean_or_zero(joint_f1),
-    "revolute_cosine": mean_or_zero(revolute_cos),
-    "revolute_angle_err_deg": mean_or_zero(revolute_ang),
-    "prismatic_cosine": mean_or_zero(prismatic_cos),
-    "prismatic_angle_err_deg": mean_or_zero(prismatic_ang),
-}
-
-print("==== Evaluation Results ====")
-for k, v in metrics.items():
-    print(f"{k}: {v:.4f}")
+if __name__ == "__main__":
+    chk = "./pre_trained_models_gcnpp/2025-11-26 22:17:23_mix/chkpt_best_model_val.pth"
+    metrics = evaluate(chk)
+    print(metrics)
