@@ -5,3 +5,6 @@ runs/
 **/*.svg
 **/*.drawio
 **/*.bkp
+**/*.log/**
+**/*.pth/**
+**/*.ckpt/**

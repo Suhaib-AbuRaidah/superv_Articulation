@@ -5,7 +5,7 @@ import os
 import sys
 sys.path.append('/home/suhaib/superv_Articulation')
 from utilis.dataset2 import PartsGraphDataset2, collate_graphs
-from GNNPP.gnn_pointnet_network import parts_connection_mlp
+from GNNPP.gnn_pointnet_network_v3 import parts_connection_mlp
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from utilis.Visualizer import VisualizerWrapper
@@ -43,9 +43,7 @@ def training_step(model, data_dict):
     total_loss = 0.0
 
     adj = adj.squeeze()
-    # print(f"\n\nAdjacency Matrix:\n{adj}\n\n")
     parts_connections_gt = parts_connections_gt.squeeze()
-    # print(f"Parts Connections GT:\n{parts_connections_gt}\n\n")
     screw_axis_list_gt = screw_axis_list_gt.squeeze().view(-1,3)
     screw_axis_list_gt = torch.abs(screw_axis_list_gt)
     screw_axis_list_gt = F.normalize(screw_axis_list_gt, dim=1)
@@ -56,20 +54,18 @@ def training_step(model, data_dict):
     # Forward pass
     edges_conne_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, z, (src, dst) = model(parts_start_list, parts_end_list, adj)
     conn_gt = parts_connections_gt[src, dst].float().unsqueeze(1)  # [num_edges, 1]
-    # print(f"\nJoint Connections Prediction\n")
-    # print(f"Edges Pred:\n{edges_conne_pred}")
-    # print(f"Edges GT:\n{conn_gt}\n\n")
-
     loss_latent = F.mse_loss(z, angles, reduction='mean')
+    # print(f"Adj: \n{adj}\n")
+    # print(f"Parts conn gt: \n{conn_gt}\n")
+    x = torch.sigmoid(edges_conne_pred)
+    x = (x > 0.5).float()
+    # print(f"Edges conn pred: \n{x}\n")
     loss_part_conn = F.binary_cross_entropy_with_logits(edges_conne_pred, conn_gt, reduction='sum')
     
     joint_mask = conn_gt.squeeze(1) > 0  # boolean mask of edges that exist
     if joint_mask.sum() > 0:
         joint_type_pred_valid = joint_type_pred[joint_mask]
         joint_type_list_gt = joint_type_list_gt.reshape(-1,1)
-        # print(f"Joint Type Prediction\n")
-        # print(f"Joint Type Pred:\n{joint_type_pred_valid}")
-        # print(f"Joint Type GT:\n{joint_type_list_gt}\n\n")
         loss_joint_type = F.binary_cross_entropy_with_logits(joint_type_pred_valid, joint_type_list_gt, reduction='sum')
     else:
         loss_joint_type = torch.tensor(0.0, device=adj.device)
@@ -78,42 +74,27 @@ def training_step(model, data_dict):
     prismatic_mask = (joint_type_list_gt == 1)  # 1 = prismatic
 
     # Compute per-edge parameter losses (L2)
-    # print(revolute_para_pred)
-    revolute_screw_axis_pred = revolute_para_pred[joint_mask].squeeze().view(-1, 3)
-    revolute_screw_axis_pred = F.normalize(revolute_screw_axis_pred, dim=1)
+    revolute_axis_pred = revolute_para_pred[:,:,:3][joint_mask].squeeze()
+    rev_weights = torch.sigmoid(revolute_para_pred[:,:,3:4][joint_mask])
+    revolute_axis_pred = (revolute_axis_pred * rev_weights).sum(dim=1) / (rev_weights.sum(dim=1) + 1e-6)
+    revolute_axis_pred = F.normalize(revolute_axis_pred, dim=1)
+    
+    prismatic_axis_pred = prismatic_para_pred[:,:,:3][joint_mask].squeeze()
+    pri_weights = torch.sigmoid(prismatic_para_pred[:,:,3:4][joint_mask])
+    prismatic_axis_pred = (prismatic_axis_pred * pri_weights).sum(dim=1) / (pri_weights.sum(dim=1) + 1e-6)
+    prismatic_axis_pred = F.normalize(prismatic_axis_pred, dim=1)
 
-    # revolute_pivot_point_pred = revolute_para_pred[:,3:][joint_mask].squeeze().view(-1, 3)
-
-    # print(revolute_screw_axis_pred)
-    # print(screw_axis_list_gt)
-    prismatic_screw_axis_pred = prismatic_para_pred[joint_mask].squeeze().view(-1,3)
-    prismatic_screw_axis_pred = F.normalize(prismatic_screw_axis_pred, dim=1)
-
-
-    # print(f"Axes Predictions\n")
-    # print(f"Revolute Axis Pred:\n{revolute_screw_axis_pred}")
-    # print(f"\nPrismatic Axis Pred:\n{prismatic_screw_axis_pred}")
-    # print(f"\nAxes GT:\n{screw_axis_list_gt}")
-
-
-
-    revolute_axis_loss = torch.sqrt(F.mse_loss(revolute_screw_axis_pred, screw_axis_list_gt, reduction='none').clamp(min=1e-12)).mean(1)
-    # revolute_pivot_loss = F.mse_loss(revolute_pivot_point_pred, screw_point_list_gt, reduction='none').mean(1)
+    revolute_axis_loss = torch.sqrt(F.mse_loss(revolute_axis_pred, screw_axis_list_gt, reduction='none').clamp(min=1e-12)).mean(1)
     revolute_loss = revolute_axis_loss
 
-    prismatic_loss = torch.sqrt(F.mse_loss(prismatic_screw_axis_pred, screw_axis_list_gt, reduction='none').clamp(min=1e-12)).mean(1)
+    prismatic_loss = torch.sqrt(F.mse_loss(prismatic_axis_pred, screw_axis_list_gt, reduction='none').clamp(min=1e-12)).mean(1)
 
     # Apply masks
 
     revolute_loss = (revolute_loss * revolute_mask.float().view(-1))
-    # print(f"\nRevolute Loss:\n{revolute_loss}")
     revolute_loss = revolute_loss.mean()
     prismatic_loss = (prismatic_loss * prismatic_mask.float().view(-1))
-    # print(f"\nPrismatic Loss:\n{prismatic_loss}")
     prismatic_loss = prismatic_loss.mean()
-
-
-    # print(f"\nLoss Part Conn: {loss_part_conn}, Loss Joint Type: {loss_joint_type}, Revolute Loss: {revolute_loss}, Prismatic Loss: {prismatic_loss}, Latent Loss: {loss_latent}\n")
     
     total_loss = loss_part_conn + loss_joint_type + revolute_loss + prismatic_loss + loss_latent
 
@@ -123,17 +104,15 @@ def training_step(model, data_dict):
 
 # --- 4. Training Step ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-dataset = PartsGraphDataset2("../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/robotic_arm_testing/scenes/*.npz",device)
-train_size = int(0.8 * len(dataset))
-val_size = len(dataset) - train_size
-train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+train_dataset = PartsGraphDataset2("../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/robotic_arm2/train/scenes/*.npz",device)
+val_dataset = PartsGraphDataset2("../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/robotic_arm2/val/scenes/*.npz",device)
 
 train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 
 start_training_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-checkpoint_path = f"./pre_trained_models_gcnpp/{start_training_time}_mix"
+checkpoint_path = f"./pre_trained_models_gcnpp/{start_training_time}_robotic_arm"
 os.makedirs(checkpoint_path, exist_ok=True)
 writer = SummaryWriter(f'runs/{start_training_time}')
 print(f"tensorboard --logdir '/home/suhaib/superv_Articulation/runs/{start_training_time}'")
@@ -151,6 +130,7 @@ params = {
     "n_class": 1,
     "latent_dim": 1,
     "decoder_out_dim": 128,
+    "motion_decoder_out_dim": 256,
 }
 
 model = parts_connection_mlp(**params).cuda()
@@ -219,16 +199,14 @@ for epoch in range(200):
         avg_loss_latent = epoch_loss_latent / step
 
         pbar_train.set_postfix({
-            "Total": f"{avg_total_loss:.4f}",
-            "conn": f"{avg_loss_part_conn:.4f}",
-            "type": f"{avg_loss_joint_type:.4f}",
-            "Rev": f"{avg_revolute_loss:.4f}",
-            "Pri": f"{avg_prismatic_loss:.4f}",
-            "Lat": f"{avg_loss_latent:.4f}"
+            "Total": f"{total_loss:.4f}",
+            "conn": f"{loss_part_conn:.4f}",
+            "type": f"{loss_joint_type:.4f}",
+            "Rev": f"{revolute_loss:.4f}",
+            "Pri": f"{prismatic_loss:.4f}",
+            "Lat": f"{loss_latent:.4f}"
         })
 
-        # if step % 10 == 0:
-        #     print(f"Epoch {epoch}, Step {step}, Avg Loss: {avg_total_loss:.4f}")
 
     # TensorBoard
     writer.add_scalar('Loss/train', avg_total_loss, epoch)
@@ -238,9 +216,7 @@ for epoch in range(200):
     writer.add_scalar('Loss/prismatic', avg_prismatic_loss, epoch)
     writer.add_scalar('Loss/latent', avg_loss_latent, epoch)
 
-    # # Epoch end — print and checkpoint
-    # print(f"Training - Epoch [{epoch+1}/500] - Avg Loss: {avg_total_loss:.4f}")
-    # print("\n")
+
     model.eval()  # turn off dropout, etc.
     val_loss = 0.0
     val_loss_part_conn = 0.0
@@ -285,8 +261,6 @@ for epoch in range(200):
     writer.add_scalar('Val/prismatic', val_prismatic_loss, epoch)
     writer.add_scalar('Val/latent', val_loss_latent, epoch)
 
-    # print(f"Validation - Epoch [{epoch+1}/500] - Loss: {val_loss:.4f}")
-    # print("\n\n")
 
     model.train()
     scheduler.step()

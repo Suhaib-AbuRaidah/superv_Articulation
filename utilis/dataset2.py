@@ -213,6 +213,7 @@ class PartsGraphDataset2(Dataset):
             center = (bound_min + bound_max) / 2
             scale = (bound_max - bound_min).max()
             pc_start = (pc_start - center) / scale
+            pc_end = (pc_end - center) / scale
 
             screw_point_list = []
             for joint in range(num_joints):
@@ -231,14 +232,14 @@ class PartsGraphDataset2(Dataset):
             parts_start_list = []
             for mask in range(num_joints+1):
                 part = pc_start[mask_start_list[mask]]
-                part = self.downsample_pc_masks(part)
+                part = self.downsample_pc_masks(part, num_points=1024)
                 part = torch.tensor(part, dtype=torch.float32).to(device)
                 parts_start_list.append(part)
             
             parts_end_list = []
             for mask in range(num_joints+1):
                 part = pc_end[mask_end_list[mask]]
-                part = self.downsample_pc_masks(part)
+                part = self.downsample_pc_masks(part, num_points=1024)
                 part = torch.tensor(part, dtype=torch.float32).to(device)
                 parts_end_list.append(part)
 
@@ -272,7 +273,7 @@ class PartsGraphDataset2(Dataset):
 
         return pc_start, parts_start_list, pc_end, parts_end_list, adjacency_matrix, parts_conne_gt, joint_type_list, screw_axis_list, screw_point_list, angles, file_name
     
-    def downsample_pc_masks(self, points, masks_list=None, num_points=1024):
+    def downsample_pc_masks(self, points, masks_list=None, num_points=4096):
         """
         Randomly downsample the point cloud to a fixed size.
         """

@@ -24,16 +24,19 @@ class STN3d(nn.Module):
         self.bn4 = nn.BatchNorm1d(512)
         self.bn5 = nn.BatchNorm1d(256)
 
-    def forward(self, x):
+    def forward(self, x, batch_norm=True):
         batchsize = x.size()[0]
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
         x = F.relu(self.bn3(self.conv3(x)))
         x = torch.max(x, 2, keepdim=True)[0]
         x = x.view(-1, 1024)
-
-        x = F.relu(self.bn4(self.fc1(x)))
-        x = F.relu(self.bn5(self.fc2(x)))
+        if batch_norm:
+            x = F.relu(self.bn4(self.fc1(x)))
+            x = F.relu(self.bn5(self.fc2(x)))
+        else:
+            x = F.relu(self.fc1(x))
+            x = F.relu(self.fc2(x))
         x = self.fc3(x)
 
         iden = Variable(torch.from_numpy(np.array([1, 0, 0, 0, 1, 0, 0, 0, 1]).astype(np.float32))).view(1, 9).repeat(
@@ -88,6 +91,7 @@ class STNkd(nn.Module):
 class PointNetEncoder(nn.Module):
     def __init__(self, global_feat=True, feature_transform=False, channel=3, out_dim=1024):
         super(PointNetEncoder, self).__init__()
+        self.out_dim = out_dim
         self.stn = STN3d(channel)
         self.conv1 = torch.nn.Conv1d(channel, 64, 1)
         self.conv2 = torch.nn.Conv1d(64, 128, 1)
@@ -100,9 +104,9 @@ class PointNetEncoder(nn.Module):
         if self.feature_transform:
             self.fstn = STNkd(k=64)
 
-    def forward(self, x):
+    def forward(self, x,batch_norm=True):
         B, D, N = x.size()
-        trans = self.stn(x)
+        trans = self.stn(x,batch_norm=batch_norm)
         x = x.transpose(2, 1)
         if D > 3:
             feature = x[:, :, 3:]
@@ -125,12 +129,12 @@ class PointNetEncoder(nn.Module):
         x = F.relu(self.bn2(self.conv2(x)))
         x = self.bn3(self.conv3(x))
         x = torch.max(x, 2, keepdim=True)[0]
-        x = x.view(-1, 1024)
+        x = x.view(-1, self.out_dim)
         if self.global_feat:
             return x, trans, trans_feat
         else:
             global_feat = x.clone()
-            x = x.view(-1, 1024, 1).repeat(1, 1, N)
+            x = x.view(-1, self.out_dim, 1).repeat(1, 1, N)
             local_feat = torch.cat([x, pointfeat], 1)
             return global_feat, local_feat, trans, trans_feat
 
