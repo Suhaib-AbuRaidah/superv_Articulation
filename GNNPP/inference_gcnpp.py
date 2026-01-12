@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import sys
 sys.path.append('/home/suhaib/superv_Articulation')
-from GNNPP.gnn_pointnet_network import parts_connection_mlp
+from GNNPP.gnn_pointnet_network_v3 import parts_connection_mlp
 import glob
 import torch.nn.functional as F
 from utilis.Inference_graph import visualize_articulated_graph
@@ -37,8 +37,8 @@ def downsample_pc_masks( points, masks_list1=None, num_points=1024):
         return points[indices]
     
 def pc_to_img(pcd, width=600, height=600, 
-              fov=45.0, 
-              camera_distance=1.5, 
+              fov=55.0, 
+              camera_distance=2.0, 
               elevation_deg=10, 
               azimuth_deg=35):
     renderer = o3d.visualization.rendering.OffscreenRenderer(width, height)
@@ -107,34 +107,24 @@ def joint_pred_to_matrix(joint_type_pred, src, dst,num_joints):
     return parts_conne
 
 
-file_paths = "../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/robotic_arm/scenes/*.npz"
+file_paths = "../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/*/val/scenes/*.npz"
 data_list = []
 for f in glob.glob(file_paths):
         data = np.load(f, allow_pickle=True)
-        mask_start_list = []
         joint_type_list = []
         screw_axis_list = []
         screw_point_list = []
-        num_joints = int((len(data)-2)/18)
+        num_joints = len(data['joint_type'])
 
-        pc_start = data[f'pc_start_0']
+        pc_start = data[f'pc_start']
+        pc_end = data[f'pc_end']
         adjacency_matrix = data['adj']
         parts_conne_gt = data['parts_conne_gt']
         
-        for joint in range(num_joints):
-            mask_start = data[f'pc_seg_start_{joint}']
-            mask_start_list.append(mask_start)
-            joint_type = data[f'joint_type_{joint}']
-            joint_type_list.append(int(joint_type))
-            screw_axis = data[f'screw_axis_{joint}']
-            screw_axis_list.append(screw_axis)
-            # screw_moment = data[f'screw_momemt_{joint}']
-            # screw_point = np.cross(screw_axis, screw_moment)
-            # screw_point_list.append(screw_point)
-
-
-        base_mask = data['pc_seg_start_base']
-        mask_start_list.insert(0, base_mask)
+        mask_start_list = data['pc_seg_start'].item()
+        mask_end_list = data['pc_seg_end'].item()
+        screw_axis_list = data['screw_axis']
+        joint_type_list = data['joint_type']
 
 
         pc_start_ds, mask_start_list_ds = downsample_pc_masks(pc_start, mask_start_list)
@@ -144,76 +134,113 @@ for f in glob.glob(file_paths):
         scale = (bound_max - bound_min).max()
         pc_start_ds = (pc_start_ds - center) / scale
 
+        pc_end_ds, mask_end_list_ds = downsample_pc_masks(pc_end, mask_end_list)
+        bound_max = pc_end_ds.max(0)
+        bound_min = pc_end_ds.min(0)
+        center = (bound_min + bound_max) / 2
+        scale = (bound_max - bound_min).max()
+        pc_end_ds = (pc_end_ds - center) / scale
         
         adjacency_matrix = torch.tensor(adjacency_matrix, dtype=torch.float32).cuda()
         parts_conne_gt = torch.tensor(parts_conne_gt, dtype=torch.float32).cuda()
 
-        parts_list = []
+        parts_start_list = []
         for mask in range(num_joints+1):
             part = pc_start_ds[mask_start_list_ds[mask]]
             part = downsample_pc_masks(part)
             part = torch.tensor(part, dtype=torch.float32).cuda().unsqueeze(0)
-            parts_list.append(part)
+            parts_start_list.append(part)
+        
+        parts_end_list = []
+        for mask in range(num_joints+1):
+            part = pc_end_ds[mask_end_list_ds[mask]]
+            part = downsample_pc_masks(part)
+            part = torch.tensor(part, dtype=torch.float32).cuda().unsqueeze(0)
+            parts_end_list.append(part)
 
         pc_start_ds = torch.tensor(pc_start_ds, dtype=torch.float32).cuda()
         joints_type = torch.tensor(np.array(joint_type_list), dtype=torch.float32).cuda()
         joints_screw_axis = torch.tensor(np.array(screw_axis_list), dtype=torch.float32).cuda()
-        data_tuple = (pc_start_ds, parts_list, adjacency_matrix, parts_conne_gt, joints_type, joints_screw_axis, pc_start,mask_start_list,screw_point_list)
+        data_tuple = (pc_start_ds, parts_start_list,pc_end_ds, parts_end_list, adjacency_matrix, parts_conne_gt, joints_type, joints_screw_axis, pc_start,mask_start_list,screw_point_list)
 
         data_list.append(data_tuple)
 np.random.seed()
+print(f"Total data samples: {len(data_list)}")
 index = np.random.randint(0, len(data_list))
-index = 182
+# index = 25
+index = 169
 print(index)
 data = data_list[index]
-pc_start_ds = data[0]
-parts_list = data[1]
-adj = data[2]
-parts_conne_gt = data[3]
-joints_type = data[4]
-joints_screw_axis = data[5]
-pc_start = data[6]
-mask_start_list = data[7]
-joints_screw_point = data[8]
+pc_start = data[0]
+parts_start_list = data[1]
+pc_end = data[2]
+parts_end_list = data[3]
+adj = data[4]
+parts_conne_gt = data[5]
+joints_type = data[6]
+joints_screw_axis = data[7]
+pc_start1 = data[8]
+mask_start_list = data[9]
+joints_screw_point = data[10]
 
 
 adj = adj.squeeze(0)
 parts_connections = parts_conne_gt.squeeze(0)
-
 params = {
     "pointnet_dim": 1024,
     "nlayers": 4,
-    "nhidden": 256,
-    "out_dim": 128,
+    "nhidden": 512,
+    "out_dim": 256,
     "dropout": 0.3,
     "lamda": 0.5,
     "alpha": 0.1,
     "variant": True,
-    "nhidden_mlp": 128,
+    "nhidden_mlp": 256,
     "n_class": 1,
+    "latent_dim": 1,
+    "decoder_out_dim": 128,
+    "motion_decoder_out_dim": 256,
 }
 
-weights_path = "/home/suhaib/superv_Articulation/pre_trained_models_gcnpp/2025-11-03 23:15:17_mix/chkpt_best_model_val.pth"
+weights_path = "/home/suhaib/superv_Articulation/pre_trained_models_gcnpp/2026-01-09 17:49:13_mix/chkpt_best_model_val.pth"
 model = parts_connection_mlp(**params).cuda()
 model.load_state_dict(torch.load(weights_path))
 model.eval()
 
 with torch.no_grad():
-    edges_conne_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, (src, dst) = model(parts_list, adj)
+    edges_conne_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, z, (src, dst) = model(parts_start_list, parts_end_list, adj)
 
 print(revolute_para_pred.shape)
-
+print(f"Joint type pred: {joint_type_pred}")
 edges_conne_pred = (torch.sigmoid(edges_conne_pred)>0.5).float()
-joint_mask = parts_conne_gt[src, dst].float().unsqueeze(1) > 0 # boolean mask of edges that exist
+# joint_mask = parts_conne_gt[src, dst].float().unsqueeze(1) > 0 # boolean mask of edges that exist
+joint_mask = torch.sigmoid(edges_conne_pred) > 0.5
 joint_mask=joint_mask.squeeze()
+print(f"Joint mask: {joint_mask}")
 joint_type_pred_valid = (torch.sigmoid(joint_type_pred[joint_mask])>0.5).float()
 joint_type_list_gt = joints_type.reshape(-1,1)
 revolute_mask = (joint_type_pred_valid == 0).squeeze()  # 0 = revolute
-revolute_screw_axis_pred = revolute_para_pred[:,:3][joint_mask].squeeze().view(-1, 3)
-print(revolute_screw_axis_pred.shape)
-revolute_pivot_point_pred = revolute_para_pred[:,3:][joint_mask].squeeze().view(-1, 3)
-prismatic_screw_axis_pred = prismatic_para_pred[joint_mask].squeeze().view(-1,3)
-axes_pred = torch.cat([revolute_screw_axis_pred[revolute_mask], prismatic_screw_axis_pred[~revolute_mask]], dim=0).squeeze(0)
+print(f"revolute_mask shape: {revolute_mask}")
+print(f"Revolute_para_pred.shape: {revolute_para_pred.shape}")
+print(f"Prismatic_para_pred.shape: {prismatic_para_pred.shape}")
+revolute_axis_pred = revolute_para_pred[:,:,:3][joint_mask].squeeze(0)
+rev_weights = torch.sigmoid(revolute_para_pred[:,:,3:4][joint_mask]).squeeze(0)
+print(f"Revolute Axis Pred Shape before weighting: {revolute_axis_pred.shape}")
+print(f"Rev weights shape: {rev_weights.shape}")
+revolute_axis_pred = (revolute_axis_pred * rev_weights).sum(dim=1) / (rev_weights.sum(dim=1) + 1e-6)
+revolute_axis_pred = F.normalize(revolute_axis_pred, dim=1)
+# revolute_pivot_point_pred = revolute_para_pred[:,:,3:][joint_mask].squeeze().view(-1, 3)
+prismatic_axis_pred = prismatic_para_pred[:,:,:3][joint_mask].squeeze()
+pri_weights = torch.sigmoid(prismatic_para_pred[:,:,3:4][joint_mask])
+prismatic_axis_pred = (prismatic_axis_pred * pri_weights).sum(dim=1) / (pri_weights.sum(dim=1) + 1e-6)
+prismatic_axis_pred = F.normalize(prismatic_axis_pred, dim=1)
+if joint_type_pred_valid.shape[0]==1:
+    if revolute_mask:
+        axes_pred = revolute_axis_pred.unsqueeze(0)
+    else:
+        axes_pred = prismatic_axis_pred.unsqueeze(0)
+else:
+    axes_pred = torch.cat([revolute_axis_pred[revolute_mask], prismatic_axis_pred[~revolute_mask]], dim=0).squeeze(0)
 
 targets = parts_conne_gt[src, dst].float()  # [num_edges, 1]
 torch.set_printoptions(precision=1)
@@ -226,7 +253,7 @@ print(f"Joints type pred: \n{joint_type_pred_valid}")
 print(f"Joints type gt: \n{joint_type_list_gt}")
 # print(f"Revolute screw axis pred: \n{revolute_screw_axis_pred}")
 # print(f"Prismatic screw axis pred: \n{prismatic_screw_axis_pred}")
-print(f"Revolute pivot point pred: \n{revolute_pivot_point_pred}")
+# print(f"Revolute pivot point pred: \n{revolute_pivot_point_pred}")
 # axes_pred[4,0]= 4.5e-2
 # axes_pred[4,2] = 9.8e-1
 axes_pred = F.normalize(axes_pred, dim=1)
@@ -236,13 +263,8 @@ print(f"Screw axis gt: \n{joints_screw_axis}")
 adj_pred = joint_pred_to_matrix(edges_conne_pred, src, dst, adj.shape[0])
 print(adj_pred)
 
-# joint_types_pred = torch.tensor([[1.],[1.],[1.]], device='cuda')
-# screw_axes_pred = torch.tensor([[ 0.8638,  0.0046, -0.1133],
-#                                 [ 0.9865,  0.0055, -0.1334],
-#                                 [ 0.7931,  0.0043, -0.1032]], device='cuda')
-
-pcd = masked_pc(pc_start, mask_start_list)
+pcd = masked_pc(pc_start1, mask_start_list)
 img = pc_to_img(pcd)
-adj_pred = np.array([[0,1,0,0],[1,0,1,0],[0,1,0,1],[0,0,1,0]])
-adj_pred = torch.tensor(adj_pred, dtype=torch.float32).cuda()
-visualize_articulated_graph(adj_pred,adj,joint_type_pred_valid, axes_pred,img)
+adj_pred = adj_pred.float().cuda()
+print(f"Joint type pred valid: \n{joint_type_pred_valid}")
+visualize_articulated_graph(adj_pred, adj, joint_type_pred_valid, axes_pred, img)

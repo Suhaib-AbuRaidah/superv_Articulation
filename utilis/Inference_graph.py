@@ -8,7 +8,7 @@ def visualize_articulated_graph(joint_conne_pred, adj, joint_types_pred, screw_a
                                 img,threshold=0.5, node_labels=None, figsize=(16, 10)):
     joint_conne_pred = joint_conne_pred.detach().cpu().numpy()
     N = joint_conne_pred.shape[0]
-
+    print(N)
     edges = []
     edge_labels = {}
     edge_count = 0
@@ -29,7 +29,7 @@ def visualize_articulated_graph(joint_conne_pred, adj, joint_types_pred, screw_a
 
     for i in range(N):
         for j in range(i+1, N):
-            if joint_conne_pred[i, j] > threshold:
+            if joint_conne_pred[i, j] >= threshold:
                 G.add_edge(i, j)
                 joint_type = joint_types_pred[edge_count].item()
                 screw_axis = screw_axes_pred[edge_count].detach().cpu().numpy()

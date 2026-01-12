@@ -16,16 +16,26 @@ import tqdm
 
 # --- CONFIGURATION ---
 BATCH_SIZE = 1
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 5e-4
 EPOCHS = 20
 NUM_WORKERS = 1
 
 
 
 WEIGHT_DECAY = 1e-4
-LR_DECAY_STEP = 10
+LR_DECAY_STEP = 4
 LR_DECAY_GAMMA = 0.8
 
+def canonical_direction(z):
+    threshold = 0.10
+    mask = (
+        (z[:, 2] >= threshold) |
+        ((z[:, 2] <= threshold) & (z[:, 1] >= threshold)) |
+        ((z[:, 2] <= threshold) & (z[:, 1] <= threshold) & (z[:, 0] >= threshold))
+    )
+
+    return torch.where(mask.unsqueeze(1), z, -z)
+    
 def training_step(model, data_dict):
     (
         pc_starts,
@@ -43,25 +53,23 @@ def training_step(model, data_dict):
     total_loss = 0.0
 
     adj = adj.squeeze()
+    # print(f"adj:\n{adj}")
     parts_connections_gt = parts_connections_gt.squeeze()
+    # print(f"parts_connections_gt:\n{parts_connections_gt}")
     screw_axis_list_gt = screw_axis_list_gt.squeeze().view(-1,3)
-    screw_axis_list_gt = torch.abs(screw_axis_list_gt)
     screw_axis_list_gt = F.normalize(screw_axis_list_gt, dim=1)
+    # screw_axis_list_gt = canonical_direction(screw_axis_list_gt)
+    # print(f"screw_axis_list_gt:\n{screw_axis_list_gt}")
     screw_point_list_gt = screw_point_list_gt.squeeze().view(-1,3)
-
     joint_type_list_gt = joint_type_list_gt.squeeze()
     angles = angles.squeeze().view(-1,1)
     # Forward pass
     edges_conne_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, z, (src, dst) = model(parts_start_list, parts_end_list, adj)
     conn_gt = parts_connections_gt[src, dst].float().unsqueeze(1)  # [num_edges, 1]
+    # print(f"conn_gt:\n{conn_gt}")
     loss_latent = F.mse_loss(z, angles, reduction='mean')
-    # print(f"Adj: \n{adj}\n")
-    # print(f"Parts conn gt: \n{conn_gt}\n")
-    x = torch.sigmoid(edges_conne_pred)
-    x = (x > 0.5).float()
-    # print(f"Edges conn pred: \n{x}\n")
+    # print(f"parts connections pred:\n{edges_conne_pred}")
     loss_part_conn = F.binary_cross_entropy_with_logits(edges_conne_pred, conn_gt, reduction='sum')
-    
     joint_mask = conn_gt.squeeze(1) > 0  # boolean mask of edges that exist
     if joint_mask.sum() > 0:
         joint_type_pred_valid = joint_type_pred[joint_mask]
@@ -72,23 +80,26 @@ def training_step(model, data_dict):
 
     revolute_mask = (joint_type_list_gt == 0)  # 0 = revolute
     prismatic_mask = (joint_type_list_gt == 1)  # 1 = prismatic
-
+    # print(f"Prismatic Mask: {prismatic_mask}")
     # Compute per-edge parameter losses (L2)
     revolute_axis_pred = revolute_para_pred[:,:,:3][joint_mask].squeeze()
     rev_weights = torch.sigmoid(revolute_para_pred[:,:,3:4][joint_mask])
     revolute_axis_pred = (revolute_axis_pred * rev_weights).sum(dim=1) / (rev_weights.sum(dim=1) + 1e-6)
     revolute_axis_pred = F.normalize(revolute_axis_pred, dim=1)
-    
+    # revolute_axis_pred = canonical_direction(revolute_axis_pred)
+    # print(f"revolute_axis_pred after:\n{revolute_axis_pred}") 
     prismatic_axis_pred = prismatic_para_pred[:,:,:3][joint_mask].squeeze()
     pri_weights = torch.sigmoid(prismatic_para_pred[:,:,3:4][joint_mask])
     prismatic_axis_pred = (prismatic_axis_pred * pri_weights).sum(dim=1) / (pri_weights.sum(dim=1) + 1e-6)
     prismatic_axis_pred = F.normalize(prismatic_axis_pred, dim=1)
-
-    revolute_axis_loss = torch.sqrt(F.mse_loss(revolute_axis_pred, screw_axis_list_gt, reduction='none').clamp(min=1e-12)).mean(1)
+    # prismatic_axis_pred = canonical_direction(prismatic_axis_pred)
+    # print(f"prismatic_axis_pred:\n{prismatic_axis_pred}")
+    # revolute_axis_loss = torch.sqrt(F.mse_loss(revolute_axis_pred, screw_axis_list_gt, reduction='none').clamp(min=1e-12)).mean(1)
+    revolute_axis_loss = 1-torch.abs(torch.sum(revolute_axis_pred * screw_axis_list_gt, dim=1)).mean()
     revolute_loss = revolute_axis_loss
 
-    prismatic_loss = torch.sqrt(F.mse_loss(prismatic_axis_pred, screw_axis_list_gt, reduction='none').clamp(min=1e-12)).mean(1)
-
+    # prismatic_loss = torch.sqrt(F.mse_loss(prismatic_axis_pred, screw_axis_list_gt, reduction='none').clamp(min=1e-12)).mean(1)
+    prismatic_loss = 1-torch.abs(torch.sum(prismatic_axis_pred * screw_axis_list_gt, dim=1)).mean()
     # Apply masks
 
     revolute_loss = (revolute_loss * revolute_mask.float().view(-1))
@@ -97,22 +108,23 @@ def training_step(model, data_dict):
     prismatic_loss = prismatic_loss.mean()
     
     total_loss = loss_part_conn + loss_joint_type + revolute_loss + prismatic_loss + loss_latent
-
+    # print(f"Losses: total={total_loss.item():.4f}, conn={loss_part_conn.item():.4f}, type={loss_joint_type.item():.4f}, revolute={revolute_loss.item():.4f}, prismatic={prismatic_loss.item():.4f}, latent={loss_latent.item():.4f}")
     return total_loss, loss_part_conn, loss_joint_type, revolute_loss, prismatic_loss, loss_latent
 
 
 
 # --- 4. Training Step ---
+torch.manual_seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-train_dataset = PartsGraphDataset2("../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/robotic_arm2/train/scenes/*.npz",device)
-val_dataset = PartsGraphDataset2("../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/robotic_arm2/val/scenes/*.npz",device)
+train_dataset = PartsGraphDataset2("../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/laptop/train/scenes/*.npz",device)
+val_dataset = PartsGraphDataset2("../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/laptop/val/scenes/*.npz",device)
 
 train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 
 start_training_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-checkpoint_path = f"./pre_trained_models_gcnpp/{start_training_time}_robotic_arm"
+checkpoint_path = f"./pre_trained_models_gcnpp/{start_training_time}_laptop"
 os.makedirs(checkpoint_path, exist_ok=True)
 writer = SummaryWriter(f'runs/{start_training_time}')
 print(f"tensorboard --logdir '/home/suhaib/superv_Articulation/runs/{start_training_time}'")
@@ -120,13 +132,13 @@ print(f"Checkpoints will be saved to: {checkpoint_path}")
 params = {
     "pointnet_dim": 1024,
     "nlayers": 4,
-    "nhidden": 256,
-    "out_dim": 128,
+    "nhidden": 512,
+    "out_dim": 256,
     "dropout": 0.3,
     "lamda": 0.5,
     "alpha": 0.1,
     "variant": True,
-    "nhidden_mlp": 128,
+    "nhidden_mlp": 256,
     "n_class": 1,
     "latent_dim": 1,
     "decoder_out_dim": 128,
@@ -238,12 +250,12 @@ for epoch in range(200):
             val_loss_latent += loss_latent.item()
 
             pbar_val.set_postfix({
-                "Total": f"{val_loss:.4f}",
-                "conn": f"{val_loss_part_conn:.4f}",
-                "type": f"{val_loss_joint_type:.4f}",
-                "Rev": f"{val_revolute_loss:.4f}",
-                "Pri": f"{val_prismatic_loss:.4f}",
-                "Lat": f"{val_loss_latent:.4f}"
+                "Total": f"{total_loss:.4f}",
+                "conn": f"{loss_part_conn:.4f}",
+                "type": f"{loss_joint_type:.4f}",
+                "Rev": f"{revolute_loss:.4f}",
+                "Pri": f"{prismatic_loss:.4f}",
+                "Lat": f"{loss_latent:.4f}"
             })
 
     val_loss /= len(val_dataloader)
@@ -266,16 +278,19 @@ for epoch in range(200):
     scheduler.step()
 
     print(f"Summary Ep {epoch+1}:\n"
-        f"Train Loss: {avg_total_loss:.4f} | "   
-        f"Val Loss: {val_loss:.4f}")
+        f"Train Loss: {avg_total_loss:.4f} | Val Loss: {val_loss:.4f}\n"
+        f"Part Conn Train Loss: {avg_loss_part_conn:.4f} | Part Conn Val Loss: {val_loss_part_conn:.4f}\n"
+        f"Joint Type Train Loss: {avg_loss_joint_type:.4f} | Joint Type Val Loss: {val_loss_joint_type:.4f}\n"
+        f"Revolute Train Loss: {avg_revolute_loss:.4f} | Revolute Val Loss: {val_revolute_loss:.4f}\n"
+        f"Prismatic Train Loss: {avg_prismatic_loss:.4f} | Prismatic Val Loss: {val_prismatic_loss:.4f}\n")
     
     if avg_total_loss < best_loss_train:
         best_loss_train = avg_total_loss
         torch.save(model.state_dict(), os.path.join(checkpoint_path, f"chkpt_best_model_train.pth"))
-    
+        print(f"\nNew best train model saved at epoch {epoch+1} with train loss {best_loss_train:.4f}")
     if val_loss < best_loss_val:
         best_loss_val = val_loss
         torch.save(model.state_dict(), os.path.join(checkpoint_path, f"chkpt_best_model_val.pth"))
-
+        print(f"\nNew best validation model saved at epoch {epoch+1} with val loss {best_loss_val:.4f}")
     if (epoch + 1) % 50 == 0:
         torch.save(model.state_dict(), os.path.join(checkpoint_path, f"chkpt_{epoch}.pth"))

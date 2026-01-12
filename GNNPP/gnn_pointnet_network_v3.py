@@ -4,6 +4,8 @@ import math
 import numpy as np
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
+import sys
+sys.path.append('/home/suhaib/superv_Articulation')
 from GNNPP.gnn_PointNetEncoder import PointNetEncoder
 import open3d as o3d
 class GraphConvolution(nn.Module):
@@ -257,7 +259,8 @@ class parts_connection_mlp(nn.Module):
             nn.Linear(2 * kwargs["out_dim"], kwargs["nhidden_mlp"]),
             nn.Dropout(kwargs["dropout"]),
             nn.ReLU(),
-            nn.Linear(kwargs["nhidden_mlp"], kwargs["n_class"]), #{connection, no-connection}
+            nn.Linear(kwargs["nhidden_mlp"], kwargs["nhidden_mlp"]//2),
+            nn.Linear(kwargs["nhidden_mlp"]//2, kwargs["n_class"]), #{connection, no-connection}
         )
 
         # MLP for joint type classification (binary-classification)
@@ -265,21 +268,24 @@ class parts_connection_mlp(nn.Module):
             nn.Linear(2 * kwargs["out_dim"], kwargs["nhidden_mlp"]),
             nn.Dropout(kwargs["dropout"]),
             nn.ReLU(),
-            nn.Linear(kwargs["nhidden_mlp"], 1),  # {revolute, prismatic}
+            nn.Linear(kwargs["nhidden_mlp"], kwargs["nhidden_mlp"]//2),
+            nn.Linear(kwargs["nhidden_mlp"]//2, kwargs["n_class"]),  # {revolute, prismatic}
         )
 
         self.revolute_mlp = nn.Sequential(
-            nn.Linear(kwargs["motion_decoder_out_dim"], kwargs["nhidden_mlp"]),
+            nn.Linear(2*kwargs["motion_decoder_out_dim"], kwargs["nhidden_mlp"]),
             nn.Dropout(kwargs["dropout"]),
             nn.ReLU(),
-            nn.Linear(kwargs["nhidden_mlp"], 4),
+            nn.Linear(kwargs["nhidden_mlp"], kwargs["nhidden_mlp"]//2),
+            nn.Linear(kwargs["nhidden_mlp"]//2, 4),
         )
 
         self.prismatic_mlp = nn.Sequential(
-            nn.Linear(kwargs["motion_decoder_out_dim"], kwargs["nhidden_mlp"]),
+            nn.Linear(2*kwargs["motion_decoder_out_dim"], kwargs["nhidden_mlp"]),
             nn.Dropout(kwargs["dropout"]),
             nn.ReLU(),
-            nn.Linear(kwargs["nhidden_mlp"], 4),
+            nn.Linear(kwargs["nhidden_mlp"], kwargs["nhidden_mlp"]//2),
+            nn.Linear(kwargs["nhidden_mlp"]//2, 4),
         )
 
                       
@@ -296,18 +302,17 @@ class parts_connection_mlp(nn.Module):
         src, dst = src[mask], dst[mask]
 
         # create per-edge connection and motion features by concatenating node motion embeddings
-        edge_conn_feats = torch.cat([h_conn[src], h_conn[dst]], dim=1)  # [num_edges, 2*out_dim]        
-        edge_motion_feats = torch.cat([h_motion[src], h_motion[dst]], dim=1)  # [num_edges, N, 2*out_dim]
+        edge_conn_feats = torch.cat([h_conn[src], h_conn[dst]], dim=1)  # [num_edges, 2*out_dim]
+        edge_motion_feats = torch.cat([h_motion[src], h_motion[dst]], dim=2)  # [num_edges, P, 2*out_dim]
 
         # Predict edge connection (binary)
         edge_pred = self.part_conn_mlp(edge_conn_feats)  # [num_edges, 1]
-
-        # Predict joint type (multi-class)
+        # Predict joint type (binary)
         joint_type_pred = self.joint_type_mlp(edge_conn_feats)  # [num_edges, 1]
-
-        revolute_para_pred = self.revolute_mlp(edge_motion_feats)
-
-        prismatic_para_pred = self.prismatic_mlp(edge_motion_feats)
+        # Predict motion parameters for revolute joints
+        revolute_para_pred = self.revolute_mlp(edge_motion_feats) # [num_edges, 4]
+        # Predict motion parameters for prismatic joints
+        prismatic_para_pred = self.prismatic_mlp(edge_motion_feats) # [num_edges, 4]
 
         return edge_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, z, (src, dst)
 
