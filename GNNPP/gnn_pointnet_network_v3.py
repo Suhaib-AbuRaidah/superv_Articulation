@@ -204,7 +204,9 @@ class DualPointNetGCNII(nn.Module):
 
         obj1_global, _, _, _ = self.pointnet_p1_enc(total_object_1, batch_norm=False)  # [1, d]
         obj2_global, _, _, _ = self.pointnet_p2_enc(total_object_2, batch_norm=False)
-
+        print(f"f1_local shape: {f1_local.shape}, f2_local shape: {f2_local.shape}")
+        print("f1_global shape:", f1_global.shape, "f2_global shape:", f2_global.shape)
+        print("obj1_global shape:", obj1_global.shape, "obj2_global shape:", obj2_global.shape)
         # -------- Global feature augmentation --------
         obj1_global_rep = obj1_global.repeat(N, 1)
         obj2_global_rep = obj2_global.repeat(N, 1)

@@ -5,12 +5,12 @@ import os
 import sys
 sys.path.append('/home/suhaib/superv_Articulation')
 from utilis.dataset2 import PartsGraphDataset2, collate_graphs
-from GNNPP.gnn_pointnet_network_v3 import parts_connection_mlp
+from GNNPP.gnn_pointnet2_network import parts_connection_mlp
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from utilis.Visualizer import VisualizerWrapper
 from torch.utils.tensorboard import SummaryWriter
-
+import open3d as o3d
 import datetime
 import tqdm
 
@@ -22,7 +22,7 @@ NUM_WORKERS = 1
 
 
 
-WEIGHT_DECAY = 1e-4
+WEIGHT_DECAY = 0.0
 LR_DECAY_STEP = 4
 LR_DECAY_GAMMA = 0.8
 
@@ -50,6 +50,16 @@ def training_step(model, data_dict):
         angles,
         file_name,
     ) = data_dict
+
+    pcd_start = o3d.geometry.PointCloud()
+    pcd_start.points = o3d.utility.Vector3dVector(pc_starts.squeeze(0).cpu().numpy())
+    pivot_point_list = []
+    for i in range(screw_point_list_gt.squeeze(0).shape[0]):
+        pivot_point_coor = screw_point_list_gt.squeeze(0)[i].cpu().numpy()
+        pivot_point = o3d.geometry.TriangleMesh.create_sphere(radius=0.01).translate(pivot_point_coor).paint_uniform_color([1, 0, 0])
+        pivot_point_list.append(pivot_point)
+    o3d.visualization.draw_geometries([pcd_start, *pivot_point_list])
+
     total_loss = 0.0
 
     adj = adj.squeeze()
@@ -64,10 +74,10 @@ def training_step(model, data_dict):
     joint_type_list_gt = joint_type_list_gt.squeeze()
     angles = angles.squeeze().view(-1,1)
     # Forward pass
-    edges_conne_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, z, (src, dst) = model(parts_start_list, parts_end_list, adj)
+    edges_conne_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, (src, dst) = model(parts_start_list, parts_end_list, adj)
     conn_gt = parts_connections_gt[src, dst].float().unsqueeze(1)  # [num_edges, 1]
     # print(f"conn_gt:\n{conn_gt}")
-    loss_latent = F.mse_loss(z, angles, reduction='mean')
+    # loss_latent = F.mse_loss(z, angles, reduction='mean')
     # print(f"parts connections pred:\n{edges_conne_pred}")
     loss_part_conn = F.binary_cross_entropy_with_logits(edges_conne_pred, conn_gt, reduction='sum')
     joint_mask = conn_gt.squeeze(1) > 0  # boolean mask of edges that exist
@@ -86,6 +96,12 @@ def training_step(model, data_dict):
     rev_weights = torch.sigmoid(revolute_para_pred[:,:,3:4][joint_mask])
     revolute_axis_pred = (revolute_axis_pred * rev_weights).sum(dim=1) / (rev_weights.sum(dim=1) + 1e-6)
     revolute_axis_pred = F.normalize(revolute_axis_pred, dim=1)
+    
+    revolute_pivot_pred = revolute_para_pred[:,:,4:7][joint_mask].squeeze()
+    rev_pivot_weights = torch.sigmoid(revolute_para_pred[:,:,7:8][joint_mask])
+    revolute_pivot_pred = (revolute_pivot_pred * rev_pivot_weights).sum(dim=1) / (rev_pivot_weights.sum(dim=1) + 1e-6)
+    # print(f"revolute_axis_pred before:\n{revolute_axis_pred}")
+
     # revolute_axis_pred = canonical_direction(revolute_axis_pred)
     # print(f"revolute_axis_pred after:\n{revolute_axis_pred}") 
     prismatic_axis_pred = prismatic_para_pred[:,:,:3][joint_mask].squeeze()
@@ -96,7 +112,8 @@ def training_step(model, data_dict):
     # print(f"prismatic_axis_pred:\n{prismatic_axis_pred}")
     # revolute_axis_loss = torch.sqrt(F.mse_loss(revolute_axis_pred, screw_axis_list_gt, reduction='none').clamp(min=1e-12)).mean(1)
     revolute_axis_loss = 1-torch.abs(torch.sum(revolute_axis_pred * screw_axis_list_gt, dim=1)).mean()
-    revolute_loss = revolute_axis_loss
+    revolute_pivot_loss = torch.sqrt(F.mse_loss(revolute_pivot_pred, screw_point_list_gt, reduction='none').clamp(min=1e-12)).mean(1)
+    revolute_loss = revolute_axis_loss + revolute_pivot_loss
 
     # prismatic_loss = torch.sqrt(F.mse_loss(prismatic_axis_pred, screw_axis_list_gt, reduction='none').clamp(min=1e-12)).mean(1)
     prismatic_loss = 1-torch.abs(torch.sum(prismatic_axis_pred * screw_axis_list_gt, dim=1)).mean()
@@ -107,24 +124,24 @@ def training_step(model, data_dict):
     prismatic_loss = (prismatic_loss * prismatic_mask.float().view(-1))
     prismatic_loss = prismatic_loss.mean()
     
-    total_loss = loss_part_conn + loss_joint_type + revolute_loss + prismatic_loss + loss_latent
+    total_loss = loss_part_conn + loss_joint_type + revolute_loss + prismatic_loss #+ loss_latent
     # print(f"Losses: total={total_loss.item():.4f}, conn={loss_part_conn.item():.4f}, type={loss_joint_type.item():.4f}, revolute={revolute_loss.item():.4f}, prismatic={prismatic_loss.item():.4f}, latent={loss_latent.item():.4f}")
-    return total_loss, loss_part_conn, loss_joint_type, revolute_loss, prismatic_loss, loss_latent
+    return total_loss, loss_part_conn, loss_joint_type, revolute_loss, prismatic_loss #, loss_latent
 
 
 
 # --- 4. Training Step ---
 torch.manual_seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-train_dataset = PartsGraphDataset2("../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/laptop/train/scenes/*.npz",device)
-val_dataset = PartsGraphDataset2("../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/laptop/val/scenes/*.npz",device)
+train_dataset = PartsGraphDataset2("../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/*/train/scenes/*.npz",device)
+val_dataset = PartsGraphDataset2("../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/*/val/scenes/*.npz",device)
 
-train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+train_dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False)
 
 
 start_training_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-checkpoint_path = f"./pre_trained_models_gcnpp/{start_training_time}_laptop"
+checkpoint_path = f"./pre_trained_models_gcnpp/{start_training_time}_L.R.W"
 os.makedirs(checkpoint_path, exist_ok=True)
 writer = SummaryWriter(f'runs/{start_training_time}')
 print(f"tensorboard --logdir '/home/suhaib/superv_Articulation/runs/{start_training_time}'")
@@ -188,7 +205,7 @@ for epoch in range(200):
                 print("Skipping add_graph:", e)
 
         optimizer.zero_grad()
-        total_loss, loss_part_conn, loss_joint_type, revolute_loss, prismatic_loss, loss_latent = training_step(model, data)
+        total_loss, loss_part_conn, loss_joint_type, revolute_loss, prismatic_loss = training_step(model, data)
         total_loss.backward()
         optimizer.step()
 
@@ -198,7 +215,7 @@ for epoch in range(200):
         epoch_loss_joint_type += loss_joint_type.item()
         epoch_revolute_loss += revolute_loss.item()
         epoch_prismatic_loss += prismatic_loss.item()
-        epoch_loss_latent += loss_latent.item()
+        # epoch_loss_latent += loss_latent.item()
 
         global_step += 1
 
@@ -208,7 +225,7 @@ for epoch in range(200):
         avg_loss_joint_type = epoch_loss_joint_type / step
         avg_revolute_loss = epoch_revolute_loss / step
         avg_prismatic_loss = epoch_prismatic_loss / step
-        avg_loss_latent = epoch_loss_latent / step
+        # avg_loss_latent = epoch_loss_latent / step
 
         pbar_train.set_postfix({
             "Total": f"{total_loss:.4f}",
@@ -216,7 +233,7 @@ for epoch in range(200):
             "type": f"{loss_joint_type:.4f}",
             "Rev": f"{revolute_loss:.4f}",
             "Pri": f"{prismatic_loss:.4f}",
-            "Lat": f"{loss_latent:.4f}"
+            # "Lat": f"{loss_latent:.4f}"
         })
 
 
@@ -226,7 +243,7 @@ for epoch in range(200):
     writer.add_scalar('Loss/joint_type', avg_loss_joint_type, epoch)
     writer.add_scalar('Loss/revolute', avg_revolute_loss, epoch)
     writer.add_scalar('Loss/prismatic', avg_prismatic_loss, epoch)
-    writer.add_scalar('Loss/latent', avg_loss_latent, epoch)
+    # writer.add_scalar('Loss/latent', avg_loss_latent, epoch)
 
 
     model.eval()  # turn off dropout, etc.
@@ -235,19 +252,19 @@ for epoch in range(200):
     val_loss_joint_type = 0.0
     val_revolute_loss = 0.0
     val_prismatic_loss = 0.0
-    val_loss_latent = 0.0
+    # val_loss_latent = 0.0
 
     pbar_val = tqdm.tqdm(val_dataloader, desc=f"Val Ep {epoch+1}", leave=True, dynamic_ncols=True)
     with torch.no_grad():  # no gradient computation
         for val_step, val_data in enumerate(pbar_val, start=1):
-            total_loss, loss_part_conn, loss_joint_type, revolute_loss, prismatic_loss,loss_latent = training_step(model, val_data)
+            total_loss, loss_part_conn, loss_joint_type, revolute_loss, prismatic_loss = training_step(model, val_data)
 
             val_loss += total_loss.item()
             val_loss_part_conn += loss_part_conn.item()
             val_loss_joint_type += loss_joint_type.item()
             val_revolute_loss += revolute_loss.item()
             val_prismatic_loss += prismatic_loss.item()
-            val_loss_latent += loss_latent.item()
+            # val_loss_latent += loss_latent.item()
 
             pbar_val.set_postfix({
                 "Total": f"{total_loss:.4f}",
@@ -255,7 +272,7 @@ for epoch in range(200):
                 "type": f"{loss_joint_type:.4f}",
                 "Rev": f"{revolute_loss:.4f}",
                 "Pri": f"{prismatic_loss:.4f}",
-                "Lat": f"{loss_latent:.4f}"
+                # "Lat": f"{loss_latent:.4f}"
             })
 
     val_loss /= len(val_dataloader)
@@ -263,7 +280,7 @@ for epoch in range(200):
     val_loss_joint_type /= len(val_dataloader)
     val_revolute_loss /= len(val_dataloader)
     val_prismatic_loss /= len(val_dataloader)
-    val_loss_latent /= len(val_dataloader)
+    # val_loss_latent /= len(val_dataloader)
 
     # Log to TensorBoard
     writer.add_scalar('Val/Loss', val_loss, epoch)
@@ -271,7 +288,7 @@ for epoch in range(200):
     writer.add_scalar('Val/joint_type', val_loss_joint_type, epoch)
     writer.add_scalar('Val/revolute', val_revolute_loss, epoch)
     writer.add_scalar('Val/prismatic', val_prismatic_loss, epoch)
-    writer.add_scalar('Val/latent', val_loss_latent, epoch)
+    # writer.add_scalar('Val/latent', val_loss_latent, epoch)
 
 
     model.train()

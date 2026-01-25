@@ -98,92 +98,95 @@ def batch_perpendicular_line(
     return p_l, dist
 
 
-class PartsGraphDataset(Dataset):
-    def __init__(self, file_paths,device):
-        # file_paths = "./data/Shape2Motion_gcn/*/scenes/*.npz"
-        data_list = []
+from torch.utils.data import Dataset
+import glob
+import numpy as np
+import torch
+
+class Segmentation_Dataset(Dataset):
+    def __init__(self, file_paths, device):
+        self.device = device
+        self.data_list = []
+
         for f in sorted(glob.glob(file_paths)):
             data = np.load(f, allow_pickle=True)
-            mask_start_list = []
-            joint_type_list = []
-            screw_axis_list = []
-            screw_point_list = []
-            num_joints = int((len(data)-4)/18)
 
-            pc_start = data[f'pc_start_0']
-            adjacency_matrix = data['adj']
-            parts_conne_gt = data['parts_conne_gt']
+            pc_start = data['pc_start']
+            pc_end = data['pc_end']
+            seg_mask_start = data['pc_seg_start'].item()
+            seg_mask_end = data['pc_seg_end'].item()
 
-            object_path = str(data['object_path'])
-            
-            if object_path.split('/')[-3] == 'robotic_arm':
-                n = adjacency_matrix.shape[0]
-                i = np.arange(n - 1)
-                adjacency_matrix[i, i + 1] = 1
+            pc_start, mask_start_list = self.downsample_pc_masks(pc_start, seg_mask_start)
+            pc_end, mask_end_list = self.downsample_pc_masks(pc_end, seg_mask_end)
 
-            for joint in range(num_joints):
-                mask_start = data[f'pc_seg_start_{joint}']
-                mask_start_list.append(mask_start)
-                joint_type = data[f'joint_type_{joint}']
-                joint_type_list.append(int(joint_type))
-                screw_axis = data[f'screw_axis_{joint}']
-                screw_moment = data[f'screw_moment_{joint}']
-                screw_point = np.cross(screw_axis, screw_moment)
-                screw_axis_list.append(screw_axis)
-                screw_point_list.append(screw_point)
+            # --- convert masks → per-point labels ---
+            seg_labels_start = self.masks_to_labels(mask_start_list)
+            seg_labels_end = self.masks_to_labels(mask_end_list)
 
-
-            base_mask = data['pc_seg_start_base']
-            mask_start_list.insert(0, base_mask)
-
-
-            pc_start, mask_start_list = self.downsample_pc_masks(pc_start, mask_start_list)
-
+            # normalize
             bound_max = pc_start.max(0)
             bound_min = pc_start.min(0)
             center = (bound_min + bound_max) / 2
             scale = (bound_max - bound_min).max()
+
             pc_start = (pc_start - center) / scale
+            pc_end = (pc_end - center) / scale
 
+            pc_start = torch.tensor(pc_start, dtype=torch.float32)
+            pc_end = torch.tensor(pc_end, dtype=torch.float32)
+            seg_labels_start = torch.tensor(seg_labels_start, dtype=torch.long)
+            seg_labels_end = torch.tensor(seg_labels_end, dtype=torch.long)
 
-            joints_type = torch.tensor(np.array(joint_type_list), dtype=torch.float32).to(device)
-            joints_screw_axis = torch.tensor(np.array(screw_axis_list), dtype=torch.float32).to(device)
-            joints_screw_point = torch.tensor(np.array(screw_point_list), dtype=torch.float32).to(device)
-            adjacency_matrix = torch.tensor(adjacency_matrix, dtype=torch.float32).to(device)
-            parts_conne_gt = torch.tensor(parts_conne_gt, dtype=torch.float32).to(device)
+            self.data_list.append(
+                (pc_start, seg_labels_start, pc_end, seg_labels_end)
+            )
 
-
-            parts_list = []
-            for mask in range(num_joints+1):
-                part = pc_start[mask_start_list[mask]]
-                part = self.downsample_pc_masks(part)
-                part = torch.tensor(part, dtype=torch.float32).to(device)
-                parts_list.append(part)
-
-            pc_start = torch.tensor(pc_start, dtype=torch.float32).to(device)
-
-            data_tuple = (pc_start, parts_list, adjacency_matrix, parts_conne_gt, joints_type, joints_screw_axis, joints_screw_point)
-
-            data_list.append(data_tuple)
-        
-        self.pairs_list = data_list
+    def masks_to_labels(self, mask_dict):
+        masks = []
+        for k in sorted(mask_dict.keys()):
+            masks.append(mask_dict[k])
+        masks = np.stack(masks, axis=0)  # (num_parts, N)
+        labels = np.argmax(masks, axis=0)
+        return labels
 
     def __len__(self):
-        return len(self.pairs_list)
+        return len(self.data_list)
 
     def __getitem__(self, idx):
-        pairs_of_pcs = self.pairs_list[idx]
+        pairs_of_pcs = self.data_list[idx]
 
         pc_start = pairs_of_pcs[0]
-        parts_list = pairs_of_pcs[1]
-        adjacency_matrix = pairs_of_pcs[2]
-        parts_conne_gt = pairs_of_pcs[3]
-        joint_type_list = pairs_of_pcs[4]
-        screw_axis_list = pairs_of_pcs[5]
-        screw_point_list = pairs_of_pcs[6]
+        seg_labels_start = pairs_of_pcs[1]
+        pc_end = pairs_of_pcs[2]
+        seg_labels_end = pairs_of_pcs[3]
 
-        return pc_start, parts_list, adjacency_matrix, parts_conne_gt, joint_type_list, screw_axis_list, screw_point_list
+        return pc_start, seg_labels_start, pc_end, seg_labels_end
     
+    def downsample_pc_masks(self, points, masks_list=None, num_points=4096):
+        """
+        Randomly downsample the point cloud to a fixed size.
+        """
+        N = points.shape[0]
+        if N == 0:
+            points = np.zeros((num_points, 3), dtype=np.float32)
+            N= num_points
+
+        if N >= num_points:
+            np.random.seed(97)
+            indices = np.random.choice(N, num_points, replace=False)
+        else:
+            np.random.seed(97)
+            indices = np.random.choice(N, num_points, replace=True)  # pad if too small
+        if masks_list is not None:
+            for i in range(len(masks_list)):
+                labels = masks_list[i]
+                labels = labels[indices]
+                masks_list[i] = labels
+            return points[indices], masks_list
+        else:
+            return points[indices]
+        
+
 
 class PartsGraphDataset2(Dataset):
     def __init__(self, file_paths,device):
@@ -220,6 +223,7 @@ class PartsGraphDataset2(Dataset):
                 screw_axis = screw_axis_list[joint]
                 screw_moment = screw_moment_list[joint]
                 screw_point = np.cross(screw_axis, screw_moment)
+                screw_point = (screw_point - center) / scale
                 screw_point_list.append(screw_point)
 
             joints_type = torch.tensor(np.array(joint_type_list), dtype=torch.float32).to(device)

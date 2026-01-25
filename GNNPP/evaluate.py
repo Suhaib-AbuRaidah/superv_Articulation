@@ -6,7 +6,7 @@ import sys
 sys.path.append('/home/suhaib/superv_Articulation')
 
 from utilis.dataset2 import PartsGraphDataset2
-from GNNPP.gnn_pointnet_network_v3 import parts_connection_mlp
+from GNNPP.gnn_pointnet2_network import parts_connection_mlp
 from torch.utils.data import DataLoader
 
 # ------------------------------------------------------------
@@ -49,6 +49,17 @@ def _empty_metrics_with_conn(conn_acc, p, r, f1):
     m["conn_f1"] = f1
     return m
 
+def point_to_axis_distance(point, axis_point, axis_dir):
+    """
+    point:      (N,3) predicted pivot
+    axis_point: (N,3) GT pivot
+    axis_dir:   (N,3) GT axis (normalized)
+    """
+    v = point - axis_point
+    proj = torch.sum(v * axis_dir, dim=1, keepdim=True) * axis_dir
+    perp = v - proj
+    return torch.norm(perp, dim=1)
+
 
 def canonical_direction(z):
     threshold = 0.15
@@ -84,10 +95,11 @@ def eval_step(model, data_dict, verbose=False, skip_invalid=True):
     joint_type_list_gt = joint_type_list_gt.view(-1).to(device)          # [E_gt]
     screw_axis_list_gt = screw_axis_list_gt.squeeze().view(-1, 3).to(device)
     screw_axis_list_gt = F.normalize(screw_axis_list_gt, dim=1)
+    screw_point_list_gt = screw_point_list_gt.squeeze().view(-1, 3).to(device)
     # screw_axis_list_gt = canonical_direction(screw_axis_list_gt)
 
     # -------- model forward --------
-    edges_conne_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, z, (src, dst) = \
+    edges_conne_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, (src, dst) = \
         model(parts_start_list, parts_end_list, adj)
 
     src = src.long().to(device)
@@ -164,6 +176,7 @@ def eval_step(model, data_dict, verbose=False, skip_invalid=True):
     #     for s, d in zip(src[joint_mask], dst[joint_mask])
     # ])
     axis_gt = screw_axis_list_gt
+    pivot_gt = screw_point_list_gt
     rev_mask = jt_gt_edges.view(-1) == 0
     pri_mask = jt_gt_edges.view(-1) == 1
 
@@ -180,6 +193,17 @@ def eval_step(model, data_dict, verbose=False, skip_invalid=True):
         print(f"pred_rev: \n{pred_rev}\ngt_rev: \n{gt_rev}")
         revolute_cos = cosine_similarity_vec(pred_rev, gt_rev).cpu().tolist()
         revolute_ang = angular_err_deg(pred_rev, gt_rev).cpu().tolist()
+
+        pivot_gt = pivot_gt[rev_mask]
+        revolute_pivot_pred = revolute_para_pred[:,:,4:7][joint_mask].squeeze()
+        rev_piv_weights = torch.sigmoid(revolute_para_pred[:,:,7:8][joint_mask])
+        revolute_pivot_pred = (revolute_pivot_pred * rev_piv_weights).sum(dim=1) / (rev_piv_weights.sum(dim=1) + 1e-6)
+        # Could also evaluate pivot point error here if desired
+        pivot_dist = point_to_axis_distance(
+        revolute_pivot_pred[rev_mask],
+        pivot_gt,
+        gt_rev).cpu().tolist()
+
 
     if pri_mask.sum() > 0:
         prismatic_axis_pred = prismatic_para_pred[:,:,:3][joint_mask].squeeze()
@@ -200,6 +224,7 @@ def eval_step(model, data_dict, verbose=False, skip_invalid=True):
         "joint_f1": joint_f1,
         "revolute_cos": revolute_cos,
         "revolute_ang": revolute_ang,
+        "revolute_pivot_dist": pivot_dist,
         "prismatic_cos": prismatic_cos,
         "prismatic_ang": prismatic_ang,
     }
@@ -213,7 +238,7 @@ def evaluate(checkpoint_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dataset = PartsGraphDataset2(
-        "../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/cabinet/val/scenes/*.npz",
+        "../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/*/val/scenes/*.npz",
         device
     )
     val_loader = DataLoader(dataset, batch_size=1, shuffle=False)
@@ -249,9 +274,10 @@ def evaluate(checkpoint_path):
     all_joint_f1 = []
     all_revolute_cos = []
     all_revolute_ang = []
+    all_revolute_pivot_dist = []
     all_prismatic_cos = []
     all_prismatic_ang = []
-
+    
     with torch.no_grad():
         for index, data in enumerate(val_loader):
             print(f"Evaluating sample {index}/{len(val_loader)}")
@@ -265,6 +291,7 @@ def evaluate(checkpoint_path):
             all_joint_f1.append(metrics["joint_f1"])
             all_revolute_cos.extend(metrics["revolute_cos"])
             all_revolute_ang.extend(metrics["revolute_ang"])
+            all_revolute_pivot_dist.extend(metrics["revolute_pivot_dist"])
             all_prismatic_cos.extend(metrics["prismatic_cos"])
             all_prismatic_ang.extend(metrics["prismatic_ang"])
 
@@ -277,6 +304,7 @@ def evaluate(checkpoint_path):
         "joint_type_f1": mean_or_zero(all_joint_f1),
         "revolute_cosine": mean_or_zero(all_revolute_cos),
         "revolute_angle_err_deg": mean_or_zero(all_revolute_ang),
+        "revolute_pivot_dist": mean_or_zero(all_revolute_pivot_dist),
         "prismatic_cosine": mean_or_zero(all_prismatic_cos),
         "prismatic_angle_err_deg": mean_or_zero(all_prismatic_ang),
     }
@@ -285,6 +313,6 @@ def evaluate(checkpoint_path):
 
 
 if __name__ == "__main__":
-    chk = "./pre_trained_models_gcnpp/2026-01-09 17:49:13_mix/chkpt_best_model_val.pth"
+    chk = "./pre_trained_models_gcnpp/2026-01-19 13:21:35_L.R.W/chkpt_best_model_val.pth"
     metrics = evaluate(chk)
     print(f"\n\n{metrics}")

@@ -2,7 +2,9 @@ import numpy as np
 import torch
 import sys
 sys.path.append('/home/suhaib/superv_Articulation')
-from GNNPP.gnn_pointnet_network_v3 import parts_connection_mlp
+from GNNPP.gnn_pointnet2_network import parts_connection_mlp
+from utilis.dataset2 import PartsGraphDataset2
+from torch.utils.data import DataLoader
 import glob
 import torch.nn.functional as F
 from utilis.Inference_graph import visualize_articulated_graph
@@ -35,7 +37,31 @@ def downsample_pc_masks( points, masks_list1=None, num_points=1024):
         return points[indices], masks_list
     else:
         return points[indices]
-    
+
+def create_axis_line(point, direction, length=0.5, color=(1, 0, 0)):
+    """
+    point: (3,)
+    direction: (3,) normalized
+    """
+    p0 = point - direction * length
+    p1 = point + direction * length
+
+    line = o3d.geometry.LineSet()
+    line.points = o3d.utility.Vector3dVector([p0, p1])
+    line.lines = o3d.utility.Vector2iVector([[0, 1]])
+    line.colors = o3d.utility.Vector3dVector([color])
+    return line
+
+
+def create_sphere(center, radius=0.01, color=(1, 0, 0)):
+    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
+    sphere.translate(center)
+    sphere.paint_uniform_color(color)
+    return sphere
+
+def part_centroid(pc, mask):
+    return pc[mask].mean(axis=0)
+
 def pc_to_img(pcd, width=600, height=600, 
               fov=55.0, 
               camera_distance=2.0, 
@@ -107,7 +133,7 @@ def joint_pred_to_matrix(joint_type_pred, src, dst,num_joints):
     return parts_conne
 
 
-file_paths = "../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/*/val/scenes/*.npz"
+file_paths = "../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/refrigerator/val/scenes/*.npz"
 data_list = []
 for f in glob.glob(file_paths):
         data = np.load(f, allow_pickle=True)
@@ -125,6 +151,8 @@ for f in glob.glob(file_paths):
         mask_end_list = data['pc_seg_end'].item()
         screw_axis_list = data['screw_axis']
         joint_type_list = data['joint_type']
+        screw_moment_list = data['screw_moment']   
+
 
 
         pc_start_ds, mask_start_list_ds = downsample_pc_masks(pc_start, mask_start_list)
@@ -140,7 +168,14 @@ for f in glob.glob(file_paths):
         center = (bound_min + bound_max) / 2
         scale = (bound_max - bound_min).max()
         pc_end_ds = (pc_end_ds - center) / scale
-        
+
+        for joint in range(num_joints):
+            screw_axis = screw_axis_list[joint]
+            screw_moment = screw_moment_list[joint]
+            screw_point = np.cross(screw_axis, screw_moment)
+            screw_point = (screw_point - center) / scale
+            screw_point_list.append(screw_point)
+
         adjacency_matrix = torch.tensor(adjacency_matrix, dtype=torch.float32).cuda()
         parts_conne_gt = torch.tensor(parts_conne_gt, dtype=torch.float32).cuda()
 
@@ -161,14 +196,15 @@ for f in glob.glob(file_paths):
         pc_start_ds = torch.tensor(pc_start_ds, dtype=torch.float32).cuda()
         joints_type = torch.tensor(np.array(joint_type_list), dtype=torch.float32).cuda()
         joints_screw_axis = torch.tensor(np.array(screw_axis_list), dtype=torch.float32).cuda()
-        data_tuple = (pc_start_ds, parts_start_list,pc_end_ds, parts_end_list, adjacency_matrix, parts_conne_gt, joints_type, joints_screw_axis, pc_start,mask_start_list,screw_point_list)
+        joints_screw_point = torch.tensor(np.array(screw_point_list), dtype=torch.float32).cuda()           
+        data_tuple = (pc_start_ds, parts_start_list,pc_end_ds, parts_end_list, adjacency_matrix, parts_conne_gt, joints_type, joints_screw_axis, pc_start,mask_start_list,joints_screw_point)
 
         data_list.append(data_tuple)
 np.random.seed()
 print(f"Total data samples: {len(data_list)}")
 index = np.random.randint(0, len(data_list))
 # index = 25
-index = 169
+# index = 169
 print(index)
 data = data_list[index]
 pc_start = data[0]
@@ -186,6 +222,32 @@ joints_screw_point = data[10]
 
 adj = adj.squeeze(0)
 parts_connections = parts_conne_gt.squeeze(0)
+
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+dataset = PartsGraphDataset2(
+    "../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/*/val/scenes/*.npz",
+    device
+)
+val_loader = DataLoader(dataset, batch_size=1, shuffle=False)
+index = np.random.randint(0, len(dataset))
+data = dataset[index]
+(
+    pc_starts,
+    parts_start_list,
+    pc_end,
+    parts_end_list,
+    adj,
+    parts_conne_gt,
+    joints_type,
+    joints_screw_axis,
+    joints_screw_point,
+    angles,
+    file_name,
+) = data
+
 params = {
     "pointnet_dim": 1024,
     "nlayers": 4,
@@ -202,13 +264,13 @@ params = {
     "motion_decoder_out_dim": 256,
 }
 
-weights_path = "/home/suhaib/superv_Articulation/pre_trained_models_gcnpp/2026-01-09 17:49:13_mix/chkpt_best_model_val.pth"
+weights_path = "/home/suhaib/superv_Articulation/pre_trained_models_gcnpp/2026-01-19 13:21:35_L.R.W/chkpt_best_model_val.pth"
 model = parts_connection_mlp(**params).cuda()
 model.load_state_dict(torch.load(weights_path))
 model.eval()
 
 with torch.no_grad():
-    edges_conne_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, z, (src, dst) = model(parts_start_list, parts_end_list, adj)
+    edges_conne_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred,(src, dst) = model(parts_start_list, parts_end_list, adj)
 
 print(revolute_para_pred.shape)
 print(f"Joint type pred: {joint_type_pred}")
@@ -229,7 +291,12 @@ print(f"Revolute Axis Pred Shape before weighting: {revolute_axis_pred.shape}")
 print(f"Rev weights shape: {rev_weights.shape}")
 revolute_axis_pred = (revolute_axis_pred * rev_weights).sum(dim=1) / (rev_weights.sum(dim=1) + 1e-6)
 revolute_axis_pred = F.normalize(revolute_axis_pred, dim=1)
-# revolute_pivot_point_pred = revolute_para_pred[:,:,3:][joint_mask].squeeze().view(-1, 3)
+
+revolute_pivot_point_pred = revolute_para_pred[:,:,4:7][joint_mask].squeeze(0)
+rev_pivot_weights = torch.sigmoid(revolute_para_pred[:,:,7:8][joint_mask]).squeeze(0)
+revolute_pivot_point_pred = (revolute_pivot_point_pred * rev_pivot_weights).sum(dim=1) / (rev_pivot_weights.sum(dim=1) + 1e-6)
+print(f"Revolute Pivot Point Pred Shape: {revolute_pivot_point_pred.shape}")
+
 prismatic_axis_pred = prismatic_para_pred[:,:,:3][joint_mask].squeeze()
 pri_weights = torch.sigmoid(prismatic_para_pred[:,:,3:4][joint_mask])
 prismatic_axis_pred = (prismatic_axis_pred * pri_weights).sum(dim=1) / (pri_weights.sum(dim=1) + 1e-6)
@@ -260,10 +327,67 @@ axes_pred = F.normalize(axes_pred, dim=1)
 print(f"Axes pred: \n{axes_pred}")
 print(f"Screw axis gt: \n{joints_screw_axis}")
 
+print(f"Revolute pivot point pred: \n{revolute_pivot_point_pred}")
+print(f"Screw point gt: \n{joints_screw_point}")
+
 adj_pred = joint_pred_to_matrix(edges_conne_pred, src, dst, adj.shape[0])
 print(adj_pred)
 
 pcd = masked_pc(pc_start1, mask_start_list)
+
+joint_geometries = []
+
+axes_pred_np = axes_pred.detach().cpu().numpy()
+rev_pivot_np = revolute_pivot_point_pred.detach().cpu().numpy()
+
+joint_idx = 0
+for e in range(joint_mask.shape[0]):
+    if not joint_mask[e]:
+        continue
+
+    src_i = src[e].item()
+    dst_i = dst[e].item()
+    axis = axes_pred_np[joint_idx]
+
+    if revolute_mask[joint_idx]:
+        # --- Revolute joint ---
+        pivot = rev_pivot_np[joint_idx]
+
+        axis_line = create_axis_line(
+            pivot,
+            axis,
+            length=0.6,
+            color=(1, 0, 0)
+        )
+        pivot_sphere = create_sphere(
+            pivot,
+            radius=0.015,
+            color=(1, 0, 0)
+        )
+
+        joint_geometries += [axis_line, pivot_sphere]
+
+    else:
+        # --- Prismatic joint ---
+        # use centroid of the moving part (dst)
+        centroid = part_centroid(pc_start1, mask_start_list[dst_i])
+
+        axis_line = create_axis_line(
+            centroid,
+            axis,
+            length=0.6,
+            color=(0, 0, 1)
+        )
+
+        joint_geometries.append(axis_line)
+
+    joint_idx += 1
+
+o3d.visualization.draw_geometries(
+    [pcd] + joint_geometries
+)
+
+
 img = pc_to_img(pcd)
 adj_pred = adj_pred.float().cuda()
 print(f"Joint type pred valid: \n{joint_type_pred_valid}")
