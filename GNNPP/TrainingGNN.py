@@ -51,15 +51,6 @@ def training_step(model, data_dict):
         file_name,
     ) = data_dict
 
-    pcd_start = o3d.geometry.PointCloud()
-    pcd_start.points = o3d.utility.Vector3dVector(pc_starts.squeeze(0).cpu().numpy())
-    pivot_point_list = []
-    for i in range(screw_point_list_gt.squeeze(0).shape[0]):
-        pivot_point_coor = screw_point_list_gt.squeeze(0)[i].cpu().numpy()
-        pivot_point = o3d.geometry.TriangleMesh.create_sphere(radius=0.01).translate(pivot_point_coor).paint_uniform_color([1, 0, 0])
-        pivot_point_list.append(pivot_point)
-    o3d.visualization.draw_geometries([pcd_start, *pivot_point_list])
-
     total_loss = 0.0
 
     adj = adj.squeeze()
@@ -73,6 +64,7 @@ def training_step(model, data_dict):
     screw_point_list_gt = screw_point_list_gt.squeeze().view(-1,3)
     joint_type_list_gt = joint_type_list_gt.squeeze()
     angles = angles.squeeze().view(-1,1)
+
     # Forward pass
     edges_conne_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, (src, dst) = model(parts_start_list, parts_end_list, adj)
     conn_gt = parts_connections_gt[src, dst].float().unsqueeze(1)  # [num_edges, 1]
@@ -133,8 +125,8 @@ def training_step(model, data_dict):
 # --- 4. Training Step ---
 torch.manual_seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-train_dataset = PartsGraphDataset2("../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/*/train/scenes/*.npz",device)
-val_dataset = PartsGraphDataset2("../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/*/val/scenes/*.npz",device)
+train_dataset = PartsGraphDataset2("../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/LRW/*/train/scenes/*.npz",device)
+val_dataset = PartsGraphDataset2("../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/LRW/*/val/scenes/*.npz",device)
 
 train_dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True)
 val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False)

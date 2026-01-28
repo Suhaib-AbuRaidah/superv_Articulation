@@ -1,13 +1,15 @@
+from xml.parsers.expat import model
 import torch
 import torch.nn.functional as F
 import numpy as np
 import os
 import sys
-sys.path.append('/home/suhaib/superv_Articulation')
+sys.path.append(os.path.expanduser('~/superv_Articulation'))
 import open3d as o3d
 from utilis.dataset2 import PartsGraphDataset2
 from GNNPP.gnn_pointnet2_network import parts_connection_mlp
 from torch.utils.data import DataLoader
+from utilis.Inference_graph import visualize_articulated_graph
 
 # ------------------------------------------------------------
 # Utility helpers
@@ -60,6 +62,13 @@ def point_to_axis_distance(point, axis_point, axis_dir):
     perp = v - proj
     return torch.norm(perp, dim=1)
 
+def joint_pred_to_matrix(joint_type_pred, src, dst,num_joints):
+    parts_conne = torch.zeros((num_joints, num_joints))
+    for i in range(joint_type_pred.shape[0]):
+        if joint_type_pred[i] > 0:
+            parts_conne[src[i], dst[i]] = 1
+            parts_conne[dst[i], src[i]] = 1
+    return parts_conne
 
 def canonical_direction(z):
     threshold = 0.15
@@ -71,15 +80,89 @@ def canonical_direction(z):
 
     return torch.where(mask.unsqueeze(1), z, -z)
 
-def draw_example(pc_starts, screw_point_list_gt):
-    pcd_start = o3d.geometry.PointCloud()
-    pcd_start.points = o3d.utility.Vector3dVector(pc_starts.squeeze(0).cpu().numpy())
-    pivot_point_list = []
-    for i in range(screw_point_list_gt.squeeze(0).shape[0]):
-        pivot_point_coor = screw_point_list_gt.squeeze(0)[i].cpu().numpy()
-        pivot_point = o3d.geometry.TriangleMesh.create_sphere(radius=0.01).translate(pivot_point_coor).paint_uniform_color([1, 0, 0])
-        pivot_point_list.append(pivot_point)
-    o3d.visualization.draw_geometries([pcd_start, *pivot_point_list])
+def draw_example(parts_start_list, revolute_axis_pred=None, prismatic_axis_pred=None, screw_point_list_gt=None, revolute_pivot_pred=None):
+    np.random.seed(0)
+    part_pcds = []
+    for part in parts_start_list:
+        part_np = part.squeeze(0).cpu().numpy()
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(part_np)
+        pcd.paint_uniform_color(np.random.rand(3))
+        part_pcds.append(pcd)
+
+    if revolute_axis_pred is not None:
+        revolute_axis_pred_list = []
+        pivot_point_list = []
+        pivot_point_pred_list = []
+
+        for i in range(screw_point_list_gt.shape[0]):
+            revolute_axis_pred_vec = revolute_axis_pred[i].cpu().numpy()
+            pivot_point_coor = screw_point_list_gt[i].cpu().numpy()
+            revolute_pivot_pred_coor = revolute_pivot_pred[i].cpu().numpy()
+            
+            # Create arrow for revolute axis
+            rev_axis1 = o3d.geometry.TriangleMesh.create_arrow(
+                cylinder_radius=0.008,
+                cone_radius=0.008,
+                cylinder_height=0.7,
+                cone_height=0.03
+            )
+            rev_axis1.compute_vertex_normals()
+            rev_axis1.paint_uniform_color([0, 0, 1])  # Blue color for axis
+            rev_axis2 = o3d.geometry.TriangleMesh.create_arrow(
+                cylinder_radius=0.008,
+                cone_radius=0.008,
+                cylinder_height=0.7,
+                cone_height=0.03
+            )
+            rev_axis2.compute_vertex_normals()
+            rev_axis2.paint_uniform_color([0, 0, 1])  # Blue color for axis
+
+
+            # Get rotation matrix from axis direction vector
+            # The arrow is initially pointing up (along +Z axis), we need to rotate it to match the predicted axis direction
+            # Calculate rotation between Z-axis and predicted axis
+            z_axis = np.array([0, 0, 1])
+            pred_axis = revolute_axis_pred_vec
+            
+            # Normalize the predicted axis vector
+            pred_axis_norm = pred_axis / np.linalg.norm(pred_axis)
+            
+            # Calculate rotation using Rodrigues' rotation formula
+            v = np.cross(z_axis, pred_axis_norm)
+            s = np.linalg.norm(v)
+            c = np.dot(z_axis, pred_axis_norm)
+            
+            if s > 1e-6:  # If not parallel
+                vx = np.array([[0, -v[2], v[1]],
+                              [v[2], 0, -v[0]],
+                              [-v[1], v[0], 0]])
+                R = np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+            else:
+                # If parallel, rotation is identity or 180 degree rotation
+                R = np.eye(3) if c > 0 else -np.eye(3)
+                R[2, 2] = 1 if c > 0 else -1
+            
+            # Apply rotation to the arrow
+            rev_axis1.rotate(R, center=(0, 0, 0))
+            rev_axis2.rotate(-R, center=(0, 0, 0))
+            # Translate the arrow to the predicted pivot point location
+            # First, we need to move it so the base of the arrow is at the pivot point
+            # The arrow is created with its base at the origin
+            rev_axis1.translate(revolute_pivot_pred_coor)
+            rev_axis2.translate(revolute_pivot_pred_coor)
+
+            revolute_axis_pred_list.append(rev_axis1)
+            revolute_axis_pred_list.append(rev_axis2)
+
+            pivot_point = o3d.geometry.TriangleMesh.create_sphere(radius=0.03).translate(pivot_point_coor).paint_uniform_color([1, 0, 0])
+            pivot_point_pred = o3d.geometry.TriangleMesh.create_sphere(radius=0.03).translate(revolute_pivot_pred_coor).paint_uniform_color([0, 1, 0])
+
+            pivot_point_list.append(pivot_point)
+            pivot_point_pred_list.append(pivot_point_pred)
+        
+        # Add revolute_axis_pred_list to the visualization
+        o3d.visualization.draw_geometries([*part_pcds, *revolute_axis_pred_list, *pivot_point_pred_list])
 # ------------------------------------------------------------
 # Evaluation step for a single sample
 # ------------------------------------------------------------
@@ -97,6 +180,8 @@ def eval_step(model, data_dict, verbose=False, skip_invalid=True):
         angles,
         file_name,
     ) = data_dict
+
+    
 
     device = next(model.parameters()).device
 
@@ -188,6 +273,7 @@ def eval_step(model, data_dict, verbose=False, skip_invalid=True):
     # ])
     axis_gt = screw_axis_list_gt
     pivot_gt = screw_point_list_gt
+    print(f"screw_axis_list_gt: \n{screw_axis_list_gt.shape}")
     rev_mask = jt_gt_edges.view(-1) == 0
     pri_mask = jt_gt_edges.view(-1) == 1
 
@@ -199,56 +285,49 @@ def eval_step(model, data_dict, verbose=False, skip_invalid=True):
         revolute_axis_pred = revolute_para_pred[:,:,:3][joint_mask].squeeze()
         rev_weights = torch.sigmoid(revolute_para_pred[:,:,3:4][joint_mask])
         revolute_axis_pred = (revolute_axis_pred * rev_weights).sum(dim=1) / (rev_weights.sum(dim=1) + 1e-6)
-        pred_rev = F.normalize(revolute_axis_pred, dim=1)[rev_mask]
+        pred_rev_axis = F.normalize(revolute_axis_pred, dim=1)[rev_mask]
         gt_rev   = axis_gt[rev_mask]
-        print(f"pred_rev: \n{pred_rev}\ngt_rev: \n{gt_rev}")
-        revolute_cos = cosine_similarity_vec(pred_rev, gt_rev).cpu().tolist()
-        revolute_ang = angular_err_deg(pred_rev, gt_rev).cpu().tolist()
+        print(f"pred_rev: \n{pred_rev_axis}\ngt_rev: \n{gt_rev}")
+        revolute_cos = cosine_similarity_vec(pred_rev_axis, gt_rev).cpu().tolist()
+        revolute_ang = angular_err_deg(pred_rev_axis, gt_rev).cpu().tolist()
 
         pivot_gt = pivot_gt[rev_mask]
         revolute_pivot_pred = revolute_para_pred[:,:,4:7][joint_mask].squeeze()
         rev_piv_weights = torch.sigmoid(revolute_para_pred[:,:,7:8][joint_mask])
         revolute_pivot_pred = (revolute_pivot_pred * rev_piv_weights).sum(dim=1) / (rev_piv_weights.sum(dim=1) + 1e-6)
         print(f"revolute_pivot_pred: \n{revolute_pivot_pred[rev_mask]}\npivot_gt: \n{pivot_gt}")
+        print(f"revolute pivot pred shape: {revolute_pivot_pred[rev_mask].shape}")
         # Could also evaluate pivot point error here if desired
         pivot_dist = point_to_axis_distance(
         revolute_pivot_pred[rev_mask],
         pivot_gt,
         gt_rev).cpu().tolist()
 
-        distances = []
-        for dist in pivot_dist:
-            distances.append(dist)
-
-        if distances and all(d < 0.08 for d in distances):
-            print("Good pivot prediction")
-
-
-
+        draw_example(parts_start_list, revolute_axis_pred=pred_rev_axis, screw_point_list_gt=screw_point_list_gt, revolute_pivot_pred=revolute_pivot_pred[rev_mask])
+        adj_pred = joint_pred_to_matrix(edges_conne_pred, src[joint_mask], dst[joint_mask], parts_connections_gt.shape[0])
+        joint_type_pred_valid = (torch.sigmoid(joint_type_pred[joint_mask])>0.5).float()
+        revolute_mask = (joint_type_pred_valid == 0).squeeze()  # 0 = revolute
+        if joint_type_pred_valid.shape[0]==1:
+            if revolute_mask:
+                axes_pred = pred_rev_axis.unsqueeze(0)
+            else:
+                axes_pred = pred_pri_axis.unsqueeze(0)
+        else:
+            axes_pred = pred_rev_axis[revolute_mask].squeeze(0)
+            # axes_pred = torch.cat([revolute_axis_pred[revolute_mask], prismatic_axis_pred[~revolute_mask]], dim=0).squeeze(0)
+        visualize_articulated_graph(adj_pred, adj, joint_type_pred_valid, axes_pred)
 
     if pri_mask.sum() > 0:
         prismatic_axis_pred = prismatic_para_pred[:,:,:3][joint_mask].squeeze()
         pri_weights = torch.sigmoid(prismatic_para_pred[:,:,3:4][joint_mask])
         prismatic_axis_pred = (prismatic_axis_pred * pri_weights).sum(dim=1) / (pri_weights.sum(dim=1) + 1e-6)
-        pred_pri = F.normalize(prismatic_axis_pred, dim=1)[pri_mask]
+        pred_pri_axis = F.normalize(prismatic_axis_pred, dim=1)[pri_mask]
         gt_pri   = axis_gt[pri_mask]
-        print(f"pred_pri: \n{pred_pri}\ngt_pri: \n{gt_pri}")
-        prismatic_cos = cosine_similarity_vec(pred_pri, gt_pri).cpu().tolist()
-        prismatic_ang = angular_err_deg(pred_pri, gt_pri).cpu().tolist()
+        print(f"pred_pri: \n{pred_pri_axis}\ngt_pri: \n{gt_pri}")
+        prismatic_cos = cosine_similarity_vec(pred_pri_axis, gt_pri).cpu().tolist()
+        prismatic_ang = angular_err_deg(pred_pri_axis, gt_pri).cpu().tolist()
 
-    return {
-        "conn_acc": conn_acc,
-        "conn_prec": conn_prec,
-        "conn_rec": conn_rec,
-        "conn_f1": conn_f1,
-        "joint_acc": joint_acc,
-        "joint_f1": joint_f1,
-        "revolute_cos": revolute_cos,
-        "revolute_ang": revolute_ang,
-        "revolute_pivot_dist": pivot_dist,
-        "prismatic_cos": prismatic_cos,
-        "prismatic_ang": prismatic_ang,
-    }
+        # draw_example(parts_start_list, prismatic_axis_pred=pred_pri_axis)
 
 
 
@@ -286,55 +365,22 @@ def evaluate(checkpoint_path):
     model.load_state_dict(torch.load(checkpoint_path))
     model.eval()
 
-    # Accumulators
-    all_conn_acc = []
-    all_conn_prec = []
-    all_conn_rec = []
-    all_conn_f1 = []
-    all_joint_acc = []
-    all_joint_f1 = []
-    all_revolute_cos = []
-    all_revolute_ang = []
-    all_revolute_pivot_dist = []
-    all_prismatic_cos = []
-    all_prismatic_ang = []
-    
+    # np.random.seed()
+    # target_idx = np.random.randint(0, len(val_loader)-1)  # choose the example you want
+    target_idx = 134  # you can also manually set the index here
     with torch.no_grad():
         for index, data in enumerate(val_loader):
-            print(f"Evaluating sample {index}/{len(val_loader)}")
-            metrics = eval_step(model, data)
-            print(f"Metrics: {metrics}")
-            all_conn_acc.append(metrics["conn_acc"])
-            all_conn_prec.append(metrics["conn_prec"])
-            all_conn_rec.append(metrics["conn_rec"])
-            all_conn_f1.append(metrics["conn_f1"])
-            all_joint_acc.append(metrics["joint_acc"])
-            all_joint_f1.append(metrics["joint_f1"])
-            all_revolute_cos.extend(metrics["revolute_cos"])
-            all_revolute_ang.extend(metrics["revolute_ang"])
-            all_revolute_pivot_dist.extend(metrics["revolute_pivot_dist"])
-            all_prismatic_cos.extend(metrics["prismatic_cos"])
-            all_prismatic_ang.extend(metrics["prismatic_ang"])
+            if index != target_idx:
+                continue
 
-    final_metrics = {
-        "conn_acc": mean_or_zero(all_conn_acc),
-        "conn_prec": mean_or_zero(all_conn_prec),
-        "conn_rec": mean_or_zero(all_conn_rec),
-        "conn_f1": mean_or_zero(all_conn_f1),
-        "joint_type_acc": mean_or_zero(all_joint_acc),
-        "joint_type_f1": mean_or_zero(all_joint_f1),
-        "revolute_cosine": mean_or_zero(all_revolute_cos),
-        "revolute_angle_err_deg": mean_or_zero(all_revolute_ang),
-        "revolute_pivot_dist": mean_or_zero(all_revolute_pivot_dist),
-        "prismatic_cosine": mean_or_zero(all_prismatic_cos),
-        "prismatic_angle_err_deg": mean_or_zero(all_prismatic_ang),
-    }
+            print(f"Evaluating sample {index}")
+            eval_step(model, data)
+            break
 
-    return final_metrics
 
 
 if __name__ == "__main__":
-    # chk = "./pre_trained_models_gcnpp/2026-01-27 15_52_25_L.R.W/chkpt_best_model_val.pth"
+    chk = "./pre_trained_models_gcnpp/2026-01-27 15_52_25_L.R.W/chkpt_best_model_val.pth"
     chk = "./pre_trained_models_gcnpp/2026-01-28 13_44_00_L.R.W/chkpt_best_model_val.pth"
     metrics = evaluate(chk)
     print(f"\n\n{metrics}")

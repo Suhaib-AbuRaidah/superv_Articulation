@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import sys
@@ -40,20 +41,35 @@ def downsample_pc_masks( points, masks_list1=None, num_points=1024):
 
 def create_axis_line(point, direction, length=0.5, color=(1, 0, 0)):
     """
-    point: (3,)
-    direction: (3,) normalized
+    point: (3,) array-like
+    direction: (3,) array-like, should be normalized
     """
+    # Convert to numpy arrays with explicit dtype
+    point = np.asarray(point, dtype=np.float64).reshape(3)
+    direction = np.asarray(direction, dtype=np.float64).reshape(3)
+    
+    # Normalize direction just in case
+    direction = direction / (np.linalg.norm(direction) + 1e-8)
+    
     p0 = point - direction * length
     p1 = point + direction * length
-
+    
+    # Debug prints
+    print(f"p0 type: {type(p0)}, shape: {p0.shape}, dtype: {p0.dtype}")
+    print(f"p1 type: {type(p1)}, shape: {p1.shape}, dtype: {p1.dtype}")
+    print(f"Creating axis line from {p0} to {p1}")
+    
+    # Create line - ensure points are in correct format
     line = o3d.geometry.LineSet()
-    line.points = o3d.utility.Vector3dVector([p0, p1])
+    points_array = np.stack([p0, p1], axis=0)  # Shape (2, 3)
+    line.points = o3d.utility.Vector3dVector(points_array)
     line.lines = o3d.utility.Vector2iVector([[0, 1]])
     line.colors = o3d.utility.Vector3dVector([color])
     return line
 
 
 def create_sphere(center, radius=0.01, color=(1, 0, 0)):
+    center = np.asarray(center)
     sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
     sphere.translate(center)
     sphere.paint_uniform_color(color)
@@ -133,7 +149,7 @@ def joint_pred_to_matrix(joint_type_pred, src, dst,num_joints):
     return parts_conne
 
 
-file_paths = "../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/refrigerator/val/scenes/*.npz"
+file_paths = "../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/LRW/*/train/scenes/*.npz"
 data_list = []
 for f in glob.glob(file_paths):
         data = np.load(f, allow_pickle=True)
@@ -228,25 +244,30 @@ parts_connections = parts_conne_gt.squeeze(0)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 dataset = PartsGraphDataset2(
-    "../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/*/val/scenes/*.npz",
+    "../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/LRW/*/val/scenes/*.npz",
     device
 )
 val_loader = DataLoader(dataset, batch_size=1, shuffle=False)
 index = np.random.randint(0, len(dataset))
-data = dataset[index]
-(
-    pc_starts,
-    parts_start_list,
-    pc_end,
-    parts_end_list,
-    adj,
-    parts_conne_gt,
-    joints_type,
-    joints_screw_axis,
-    joints_screw_point,
-    angles,
-    file_name,
-) = data
+for i, data in enumerate(val_loader):
+    if index == i:
+        print(f"Selected index: {index}")
+        (
+            pc_starts,
+            parts_start_list,
+            pc_end,
+            parts_end_list,
+            adj,
+            parts_conne_gt,
+            joints_type,
+            joints_screw_axis,
+            joints_screw_point,
+            angles,
+            file_name,
+        ) = data
+        adj = adj.squeeze()
+    else:
+        continue
 
 params = {
     "pointnet_dim": 1024,
@@ -264,7 +285,7 @@ params = {
     "motion_decoder_out_dim": 256,
 }
 
-weights_path = "/home/suhaib/superv_Articulation/pre_trained_models_gcnpp/2026-01-19 13:21:35_L.R.W/chkpt_best_model_val.pth"
+weights_path = os.path.expanduser("~/superv_Articulation/pre_trained_models_gcnpp/2026-01-27 15_52_25_L.R.W/chkpt_best_model_train.pth")
 model = parts_connection_mlp(**params).cuda()
 model.load_state_dict(torch.load(weights_path))
 model.eval()
@@ -341,6 +362,8 @@ axes_pred_np = axes_pred.detach().cpu().numpy()
 rev_pivot_np = revolute_pivot_point_pred.detach().cpu().numpy()
 
 joint_idx = 0
+joint_mask = joint_mask.unsqueeze(0)
+revolute_mask = revolute_mask.unsqueeze(0)
 for e in range(joint_mask.shape[0]):
     if not joint_mask[e]:
         continue
@@ -348,11 +371,12 @@ for e in range(joint_mask.shape[0]):
     src_i = src[e].item()
     dst_i = dst[e].item()
     axis = axes_pred_np[joint_idx]
+    print(f"axis: {axis}")
 
     if revolute_mask[joint_idx]:
         # --- Revolute joint ---
         pivot = rev_pivot_np[joint_idx]
-
+        print(f"pivot: {pivot}")
         axis_line = create_axis_line(
             pivot,
             axis,

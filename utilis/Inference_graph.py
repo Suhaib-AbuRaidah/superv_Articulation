@@ -5,19 +5,18 @@ import numpy as np
 from matplotlib.patches import Patch
 
 def visualize_articulated_graph(joint_conne_pred, adj, joint_types_pred, screw_axes_pred,
-                                img,threshold=0.5, node_labels=None, figsize=(16, 10)):
+                                img=None,threshold=0.5, node_labels=None, figsize=(12, 8)):
     joint_conne_pred = joint_conne_pred.detach().cpu().numpy()
     N = joint_conne_pred.shape[0]
-    print(N)
     edges = []
     edge_labels = {}
     edge_count = 0
+
 
     G = nx.Graph()
     G.add_nodes_from(range(N))
     G1 = nx.Graph()
     G1.add_nodes_from(range(N))
-
     if node_labels is None:
         node_labels = [f"P{i}" for i in range(N)]
 
@@ -57,29 +56,34 @@ def visualize_articulated_graph(joint_conne_pred, adj, joint_types_pred, screw_a
     pos = nx.circular_layout(G)
     pos1 = nx.spring_layout(G1, seed=42)
 
-    fig, axes = plt.subplots(1, 3, figsize=figsize, gridspec_kw={"width_ratios": [1.4, 1, 2]})
 
     # --- Left: Point Cloud ---
-    axes[0].imshow(img)
-    axes[0].set_title("Input Point Cloud with Masks", fontsize=16, fontweight="bold")
-    axes[0].legend(handles=legend_elements, loc='center left', bbox_to_anchor=(0.9, 0.5), fontsize=12)
-    axes[0].axis("off")
+    if img is not None:
+        fig, axes = plt.subplots(1, 3, figsize=figsize, gridspec_kw={"width_ratios": [1.4, 1, 2]})
+        axes[0].imshow(img)
+        axes[0].set_title("Input Point Cloud with Masks", fontsize=16, fontweight="bold")
+        axes[0].legend(handles=legend_elements, loc='center left', bbox_to_anchor=(0.9, 0.5), fontsize=12)
+        axes[0].axis("off")
+    else:
+        fig, axes = plt.subplots(1, 2, figsize=figsize, gridspec_kw={"width_ratios": [1, 1]})
+        # axes = [axes[0], axes[1], None]
+    num_axes = 3 if img is not None else 2
 
     # --- Middle: Ground Truth Graph ---
     nx.draw(G1, pos1, with_labels=True, labels={i: node_labels[i] for i in range(N)},
-            node_size=800, node_color="lightblue", font_size=12, font_weight="bold", ax=axes[1])
+            node_size=800, node_color="lightblue", font_size=12, font_weight="bold", ax=axes[num_axes - 2])
 
-    axes[1].set_title("Initial Kinematic Graph", fontsize=16, fontweight="bold")
-    axes[1].axis("off")
+    axes[num_axes - 2].set_title("Initial Kinematic Graph", fontsize=16, fontweight="bold")
+    axes[num_axes - 2].axis("off")
 
     # --- Right: Predicted Graph ---
     nx.draw(G, pos, with_labels=True, labels={i: node_labels[i] for i in range(N)},
-            node_size=800, node_color="lightblue", font_size=14, font_weight="bold", ax=axes[2])
+            node_size=800, node_color="lightblue", font_size=14, font_weight="bold", ax=axes[num_axes - 1])
     nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels,
-                                font_color="darkred", font_size=12, font_weight="bold", ax=axes[2])
-    axes[2].set_title("Kinematic Graph with Articulation Prediction", fontsize=16, fontweight="bold")
-    axes[2].axis("off")
-
+                                font_color="darkred", font_size=12, font_weight="bold", ax=axes[num_axes - 1])
+    axes[num_axes - 1].set_title("Kinematic Graph with Articulation Prediction", fontsize=16, fontweight="bold")
+    axes[num_axes - 1].axis("off")
     plt.tight_layout()
     plt.savefig("articulated_graph.svg")
     plt.show()
+
