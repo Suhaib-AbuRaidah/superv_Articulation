@@ -11,8 +11,7 @@ runs/
 **/*.pth/**
 **/*.ckpt/**
 **/*.png/**
-**/log*.txt
-**/log.txt
+log*.txt
 **/environment.*/**
 **/__pycache__/**
 **/*.npz/**
