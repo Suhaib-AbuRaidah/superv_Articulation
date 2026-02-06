@@ -299,7 +299,24 @@ class parts_connection_mlp(nn.Module):
             nn.Linear(kwargs["nhidden_mlp"]//2, 4),
         )
 
-                      
+        self.revolute_mlp2 = nn.Sequential(
+            nn.Linear(kwargs["motion_decoder_out_dim"], kwargs["nhidden_mlp"]),
+            nn.Dropout(kwargs["dropout"]),
+            nn.ReLU(),
+            nn.Linear(kwargs["nhidden_mlp"], kwargs["nhidden_mlp"]//2),
+            nn.ReLU(),
+            nn.Linear(kwargs["nhidden_mlp"]//2, 8),
+        )
+
+        self.prismatic_mlp2 = nn.Sequential(
+            nn.Linear(kwargs["motion_decoder_out_dim"], kwargs["nhidden_mlp"]),
+            nn.Dropout(kwargs["dropout"]),
+            nn.ReLU(),
+            nn.Linear(kwargs["nhidden_mlp"], kwargs["nhidden_mlp"]//2),
+            nn.ReLU(),
+            nn.Linear(kwargs["nhidden_mlp"]//2, 4),
+        )
+
     def forward(self, part_pointclouds_start, part_pointclouds_end, adj):
         # Node embeddings
         h_conn,h_motion = self.pointnetgcn(part_pointclouds_start, part_pointclouds_end, adj)  # [N, out_dim]
@@ -314,16 +331,16 @@ class parts_connection_mlp(nn.Module):
 
         # create per-edge connection and motion features by concatenating node motion embeddings
         edge_conn_feats = torch.cat([h_conn[src], h_conn[dst]], dim=2)  # [num_edges, 2*(out_dim+connection_decoder_out_dim)]
-        edge_motion_feats = torch.cat([h_motion[src], h_motion[dst]], dim=2)  # [num_edges, P, 2*motion_decoder_out_dim]
-
+        # edge_motion_feats = torch.cat([h_motion[src], h_motion[dst]], dim=2)  # [num_edges, P, 2*motion_decoder_out_dim]
+        edge_motion_feats = torch.cat([h_motion[src], h_motion[dst]], dim=1)  # [num_edges, 2P, motion_decoder_out_dim]
         # Predict edge connection (binary)
         edge_pred = self.part_conn_mlp(edge_conn_feats)  # [num_edges, P, 1]
         # Predict joint type (binary)
         joint_type_pred = self.joint_type_mlp(edge_conn_feats)  # [num_edges, P, 1]
         # Predict motion parameters for revolute joints
-        revolute_para_pred = self.revolute_mlp(edge_motion_feats) # [num_edges, P, 8]
+        revolute_para_pred = self.revolute_mlp2(edge_motion_feats) # [num_edges, P, 8]
         # Predict motion parameters for prismatic joints
-        prismatic_para_pred = self.prismatic_mlp(edge_motion_feats) # [num_edges, P, 4]
+        prismatic_para_pred = self.prismatic_mlp2(edge_motion_feats) # [num_edges, P, 4]
 
         return edge_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, (src, dst)
 
