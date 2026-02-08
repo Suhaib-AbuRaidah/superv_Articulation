@@ -2,7 +2,7 @@ import os
 import numpy as np
 import torch
 import sys
-sys.path.append('/home/suhaib/superv_Articulation')
+sys.path.append(os.path.expanduser('~/superv_Articulation'))
 from GNNPP.gnn_pointnet2_network import parts_connection_mlp
 from utilis.dataset2 import PartsGraphDataset2
 from torch.utils.data import DataLoader
@@ -41,35 +41,20 @@ def downsample_pc_masks( points, masks_list1=None, num_points=1024):
 
 def create_axis_line(point, direction, length=0.5, color=(1, 0, 0)):
     """
-    point: (3,) array-like
-    direction: (3,) array-like, should be normalized
+    point: (3,)
+    direction: (3,) normalized
     """
-    # Convert to numpy arrays with explicit dtype
-    point = np.asarray(point, dtype=np.float64).reshape(3)
-    direction = np.asarray(direction, dtype=np.float64).reshape(3)
-    
-    # Normalize direction just in case
-    direction = direction / (np.linalg.norm(direction) + 1e-8)
-    
     p0 = point - direction * length
     p1 = point + direction * length
-    
-    # Debug prints
-    print(f"p0 type: {type(p0)}, shape: {p0.shape}, dtype: {p0.dtype}")
-    print(f"p1 type: {type(p1)}, shape: {p1.shape}, dtype: {p1.dtype}")
-    print(f"Creating axis line from {p0} to {p1}")
-    
-    # Create line - ensure points are in correct format
+
     line = o3d.geometry.LineSet()
-    points_array = np.stack([p0, p1], axis=0)  # Shape (2, 3)
-    line.points = o3d.utility.Vector3dVector(points_array)
+    line.points = o3d.utility.Vector3dVector([p0, p1])
     line.lines = o3d.utility.Vector2iVector([[0, 1]])
     line.colors = o3d.utility.Vector3dVector([color])
     return line
 
 
 def create_sphere(center, radius=0.01, color=(1, 0, 0)):
-    center = np.asarray(center)
     sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
     sphere.translate(center)
     sphere.paint_uniform_color(color)
@@ -144,130 +129,124 @@ def joint_pred_to_matrix(joint_type_pred, src, dst,num_joints):
     parts_conne = torch.zeros((num_joints, num_joints))
     for i in range(joint_type_pred.shape[0]):
         if joint_type_pred[i] > 0:
-            parts_conne[src[i], dst[i]] = 1
+            parts_conne[src[i], dst[i]] = 1 
             parts_conne[dst[i], src[i]] = 1
     return parts_conne
 
 
-file_paths = "../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/LRW/*/train/scenes/*.npz"
-data_list = []
-for f in glob.glob(file_paths):
-        data = np.load(f, allow_pickle=True)
-        joint_type_list = []
-        screw_axis_list = []
-        screw_point_list = []
-        num_joints = len(data['joint_type'])
+# file_paths = os.path.expanduser("~/superv_Articulation/data/Shape2Motion_gcn/LRW/*/val/scenes/*.npz")  
+# data_list = []
+# for f in glob.glob(file_paths):
+#         data = np.load(f, allow_pickle=True)
+#         joint_type_list = []
+#         screw_axis_list = []
+#         screw_point_list = []
+#         num_joints = len(data['joint_type'])
 
-        pc_start = data[f'pc_start']
-        pc_end = data[f'pc_end']
-        adjacency_matrix = data['adj']
-        parts_conne_gt = data['parts_conne_gt']
+#         pc_start = data[f'pc_start']
+#         pc_end = data[f'pc_end']
+#         adjacency_matrix = data['adj']
+#         parts_conne_gt = data['parts_conne_gt']
         
-        mask_start_list = data['pc_seg_start'].item()
-        mask_end_list = data['pc_seg_end'].item()
-        screw_axis_list = data['screw_axis']
-        joint_type_list = data['joint_type']
-        screw_moment_list = data['screw_moment']   
+#         mask_start_list = data['pc_seg_start'].item()
+#         mask_end_list = data['pc_seg_end'].item()
+#         screw_axis_list = data['screw_axis']
+#         joint_type_list = data['joint_type']
+#         screw_moment_list = data['screw_moment']   
 
 
 
-        pc_start_ds, mask_start_list_ds = downsample_pc_masks(pc_start, mask_start_list)
-        bound_max = pc_start_ds.max(0)
-        bound_min = pc_start_ds.min(0)
-        center = (bound_min + bound_max) / 2
-        scale = (bound_max - bound_min).max()
-        pc_start_ds = (pc_start_ds - center) / scale
+#         pc_start_ds, mask_start_list_ds = downsample_pc_masks(pc_start, mask_start_list)
+#         bound_max = pc_start_ds.max(0)
+#         bound_min = pc_start_ds.min(0)
+#         center = (bound_min + bound_max) / 2
+#         scale = (bound_max - bound_min).max()
+#         pc_start_ds = (pc_start_ds - center) / scale
 
-        pc_end_ds, mask_end_list_ds = downsample_pc_masks(pc_end, mask_end_list)
-        bound_max = pc_end_ds.max(0)
-        bound_min = pc_end_ds.min(0)
-        center = (bound_min + bound_max) / 2
-        scale = (bound_max - bound_min).max()
-        pc_end_ds = (pc_end_ds - center) / scale
+#         pc_end_ds, mask_end_list_ds = downsample_pc_masks(pc_end, mask_end_list)
+#         bound_max = pc_end_ds.max(0)
+#         bound_min = pc_end_ds.min(0)
+#         center = (bound_min + bound_max) / 2
+#         scale = (bound_max - bound_min).max()
+#         pc_end_ds = (pc_end_ds - center) / scale
 
-        for joint in range(num_joints):
-            screw_axis = screw_axis_list[joint]
-            screw_moment = screw_moment_list[joint]
-            screw_point = np.cross(screw_axis, screw_moment)
-            screw_point = (screw_point - center) / scale
-            screw_point_list.append(screw_point)
+#         for joint in range(num_joints):
+#             screw_axis = screw_axis_list[joint]
+#             screw_moment = screw_moment_list[joint]
+#             screw_point = np.cross(screw_axis, screw_moment)
+#             screw_point = (screw_point - center) / scale
+#             screw_point_list.append(screw_point)
 
-        adjacency_matrix = torch.tensor(adjacency_matrix, dtype=torch.float32).cuda()
-        parts_conne_gt = torch.tensor(parts_conne_gt, dtype=torch.float32).cuda()
+#         adjacency_matrix = torch.tensor(adjacency_matrix, dtype=torch.float32).cuda()
+#         parts_conne_gt = torch.tensor(parts_conne_gt, dtype=torch.float32).cuda()
 
-        parts_start_list = []
-        for mask in range(num_joints+1):
-            part = pc_start_ds[mask_start_list_ds[mask]]
-            part = downsample_pc_masks(part)
-            part = torch.tensor(part, dtype=torch.float32).cuda().unsqueeze(0)
-            parts_start_list.append(part)
+#         parts_start_list = []
+#         for mask in range(num_joints+1):
+#             part = pc_start_ds[mask_start_list_ds[mask]]
+#             part = downsample_pc_masks(part)
+#             part = torch.tensor(part, dtype=torch.float32).cuda().unsqueeze(0)
+#             parts_start_list.append(part)
         
-        parts_end_list = []
-        for mask in range(num_joints+1):
-            part = pc_end_ds[mask_end_list_ds[mask]]
-            part = downsample_pc_masks(part)
-            part = torch.tensor(part, dtype=torch.float32).cuda().unsqueeze(0)
-            parts_end_list.append(part)
+#         parts_end_list = []
+#         for mask in range(num_joints+1):
+#             part = pc_end_ds[mask_end_list_ds[mask]]
+#             part = downsample_pc_masks(part)
+#             part = torch.tensor(part, dtype=torch.float32).cuda().unsqueeze(0)
+#             parts_end_list.append(part)
 
-        pc_start_ds = torch.tensor(pc_start_ds, dtype=torch.float32).cuda()
-        joints_type = torch.tensor(np.array(joint_type_list), dtype=torch.float32).cuda()
-        joints_screw_axis = torch.tensor(np.array(screw_axis_list), dtype=torch.float32).cuda()
-        joints_screw_point = torch.tensor(np.array(screw_point_list), dtype=torch.float32).cuda()           
-        data_tuple = (pc_start_ds, parts_start_list,pc_end_ds, parts_end_list, adjacency_matrix, parts_conne_gt, joints_type, joints_screw_axis, pc_start,mask_start_list,joints_screw_point)
+#         pc_start_ds = torch.tensor(pc_start_ds, dtype=torch.float32).cuda()
+#         joints_type = torch.tensor(np.array(joint_type_list), dtype=torch.float32).cuda()
+#         joints_screw_axis = torch.tensor(np.array(screw_axis_list), dtype=torch.float32).cuda()
+#         joints_screw_point = torch.tensor(np.array(screw_point_list), dtype=torch.float32).cuda()           
+#         data_tuple = (pc_start_ds, parts_start_list,pc_end_ds, parts_end_list, adjacency_matrix, parts_conne_gt, joints_type, joints_screw_axis, pc_start,mask_start_list,joints_screw_point)
 
-        data_list.append(data_tuple)
-np.random.seed()
-print(f"Total data samples: {len(data_list)}")
-index = np.random.randint(0, len(data_list))
-# index = 25
-# index = 169
-print(index)
-data = data_list[index]
-pc_start = data[0]
-parts_start_list = data[1]
-pc_end = data[2]
-parts_end_list = data[3]
-adj = data[4]
-parts_conne_gt = data[5]
-joints_type = data[6]
-joints_screw_axis = data[7]
-pc_start1 = data[8]
-mask_start_list = data[9]
-joints_screw_point = data[10]
+#         data_list.append(data_tuple)
+# np.random.seed()
+# print(f"Total data samples: {len(data_list)}")
+# index = np.random.randint(0, len(data_list))
+# # index = 25
+# # index = 169
+# print(index)
+# data = data_list[index]
+# pc_start = data[0]
+# parts_start_list = data[1]
+# pc_end = data[2]
+# parts_end_list = data[3]
+# adj = data[4]
+# parts_conne_gt = data[5]
+# joints_type = data[6]
+# joints_screw_axis = data[7]
+# pc_start1 = data[8]
+# mask_start_list = data[9]
+# joints_screw_point = data[10]
 
 
-adj = adj.squeeze(0)
-parts_connections = parts_conne_gt.squeeze(0)
+# adj = adj.squeeze(0)
+# parts_connections = parts_conne_gt.squeeze(0)
 
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-dataset = PartsGraphDataset2(
-    "../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/LRW/*/val/scenes/*.npz",
-    device
-)
+dataset = PartsGraphDataset2(os.path.expanduser(
+    "~/superv_Articulation/data/Shape2Motion_gcn/LRW/*/val/scenes/*.npz"
+), device=device)
 val_loader = DataLoader(dataset, batch_size=1, shuffle=False)
 index = np.random.randint(0, len(dataset))
-for i, data in enumerate(val_loader):
-    if index == i:
-        print(f"Selected index: {index}")
-        (
-            pc_starts,
-            parts_start_list,
-            pc_end,
-            parts_end_list,
-            adj,
-            parts_conne_gt,
-            joints_type,
-            joints_screw_axis,
-            joints_screw_point,
-            angles,
-            file_name,
-        ) = data
-        adj = adj.squeeze()
-    else:
-        continue
+data = dataset[index]
+(
+    pc_starts,
+    parts_start_list,
+    pc_end,
+    parts_end_list,
+    adj,
+    parts_conne_gt,
+    joints_type,
+    joints_screw_axis,
+    joints_screw_point,
+    angles,
+    file_name,
+) = data
 
 params = {
     "pointnet_dim": 1024,
@@ -285,7 +264,7 @@ params = {
     "motion_decoder_out_dim": 256,
 }
 
-weights_path = os.path.expanduser("~/superv_Articulation/pre_trained_models_gcnpp/2026-01-27 15_52_25_L.R.W/chkpt_best_model_train.pth")
+weights_path = os.path.expanduser("~/superv_Articulation/pre_trained_models_gcnpp/2026-01-27 15:52:25_L.R.W/chkpt_best_model_val.pth")
 model = parts_connection_mlp(**params).cuda()
 model.load_state_dict(torch.load(weights_path))
 model.eval()
@@ -362,8 +341,6 @@ axes_pred_np = axes_pred.detach().cpu().numpy()
 rev_pivot_np = revolute_pivot_point_pred.detach().cpu().numpy()
 
 joint_idx = 0
-joint_mask = joint_mask.unsqueeze(0)
-revolute_mask = revolute_mask.unsqueeze(0)
 for e in range(joint_mask.shape[0]):
     if not joint_mask[e]:
         continue
@@ -371,12 +348,11 @@ for e in range(joint_mask.shape[0]):
     src_i = src[e].item()
     dst_i = dst[e].item()
     axis = axes_pred_np[joint_idx]
-    print(f"axis: {axis}")
 
     if revolute_mask[joint_idx]:
         # --- Revolute joint ---
         pivot = rev_pivot_np[joint_idx]
-        print(f"pivot: {pivot}")
+
         axis_line = create_axis_line(
             pivot,
             axis,

@@ -2,7 +2,8 @@ import torch.nn as nn
 import torch
 import torch.nn.functional as F
 import sys
-sys.path.append('/home/suhaib/superv_Articulation/PointNet2')
+import os
+sys.path.append(os.path.expanduser('~/superv_Articulation/PointNet2'))
 from models.pointnet2_utils import PointNetSetAbstractionMsg,PointNetSetAbstraction,PointNetFeaturePropagation
 
 
