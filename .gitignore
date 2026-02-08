@@ -1,10 +1,18 @@
 # pre_trained_models directories
 pre_trained_models*/
+**/data/**
 Pairs/
 runs/
-**/*.svg
-**/*.drawio
-**/*.bkp
+**/*.zip/**
+**/*.svg/**
+**/*.drawio/**
+**/*.bkp/**
 **/*.log/**
 **/*.pth/**
 **/*.ckpt/**
+**/*.png/**
+log*.txt
+**/environment.*/**
+**/__pycache__/**
+**/*.npz/**
+*.drawio*
