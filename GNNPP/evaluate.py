@@ -3,10 +3,10 @@ import torch.nn.functional as F
 import numpy as np
 import os
 import sys
-sys.path.append('/home/suhaib/superv_Articulation')
-import open3d as o3d
+sys.path.append(os.path.expanduser('~/superv_Articulation'))
+
 from utilis.dataset2 import PartsGraphDataset2
-from GNNPP.gnn_pointnet2_network import parts_connection_mlp
+from GNNPP.gnn_pointnet2_network_v2 import parts_connection_mlp
 from torch.utils.data import DataLoader
 
 # ------------------------------------------------------------
@@ -70,16 +70,6 @@ def canonical_direction(z):
     )
 
     return torch.where(mask.unsqueeze(1), z, -z)
-
-def draw_example(pc_starts, screw_point_list_gt):
-    pcd_start = o3d.geometry.PointCloud()
-    pcd_start.points = o3d.utility.Vector3dVector(pc_starts.squeeze(0).cpu().numpy())
-    pivot_point_list = []
-    for i in range(screw_point_list_gt.squeeze(0).shape[0]):
-        pivot_point_coor = screw_point_list_gt.squeeze(0)[i].cpu().numpy()
-        pivot_point = o3d.geometry.TriangleMesh.create_sphere(radius=0.01).translate(pivot_point_coor).paint_uniform_color([1, 0, 0])
-        pivot_point_list.append(pivot_point)
-    o3d.visualization.draw_geometries([pcd_start, *pivot_point_list])
 # ------------------------------------------------------------
 # Evaluation step for a single sample
 # ------------------------------------------------------------
@@ -108,11 +98,13 @@ def eval_step(model, data_dict, verbose=False, skip_invalid=True):
     screw_point_list_gt = screw_point_list_gt.squeeze().view(-1, 3).to(device)
     # screw_axis_list_gt = canonical_direction(screw_axis_list_gt)
 
-    
     # -------- model forward --------
     edges_conne_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, (src, dst) = \
         model(parts_start_list, parts_end_list, adj)
-
+    
+    edges_conne_pred = edges_conne_pred.mean(dim=1)
+    joint_type_pred = joint_type_pred.mean(dim=1)
+    
     src = src.long().to(device)
     dst = dst.long().to(device)
 
@@ -121,6 +113,7 @@ def eval_step(model, data_dict, verbose=False, skip_invalid=True):
 
     # -------- model-edge GT connectivity --------
     conn_gt = parts_connections_gt[src, dst].float().unsqueeze(1)
+
 
     conn_pred_lbl = binarize(edges_conne_pred)
     print(f"conn_gt: \n{conn_gt}")
@@ -191,7 +184,7 @@ def eval_step(model, data_dict, verbose=False, skip_invalid=True):
     rev_mask = jt_gt_edges.view(-1) == 0
     pri_mask = jt_gt_edges.view(-1) == 1
 
-    revolute_cos, revolute_ang = [], []
+    revolute_cos, revolute_ang, pivot_dist = [], [], []
     prismatic_cos, prismatic_ang = [], []
 
     if rev_mask.sum() > 0:
@@ -209,21 +202,11 @@ def eval_step(model, data_dict, verbose=False, skip_invalid=True):
         revolute_pivot_pred = revolute_para_pred[:,:,4:7][joint_mask].squeeze()
         rev_piv_weights = torch.sigmoid(revolute_para_pred[:,:,7:8][joint_mask])
         revolute_pivot_pred = (revolute_pivot_pred * rev_piv_weights).sum(dim=1) / (rev_piv_weights.sum(dim=1) + 1e-6)
-        print(f"revolute_pivot_pred: \n{revolute_pivot_pred[rev_mask]}\npivot_gt: \n{pivot_gt}")
         # Could also evaluate pivot point error here if desired
         pivot_dist = point_to_axis_distance(
         revolute_pivot_pred[rev_mask],
         pivot_gt,
         gt_rev).cpu().tolist()
-
-        distances = []
-        for dist in pivot_dist:
-            distances.append(dist)
-
-        if distances and all(d < 0.08 for d in distances):
-            print("Good pivot prediction")
-
-
 
 
     if pri_mask.sum() > 0:
@@ -259,7 +242,7 @@ def evaluate(checkpoint_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dataset = PartsGraphDataset2(
-        "../Ditto/Articulated_object_simulation-main/data/Shape2Motion_gcn/LRW/*/val/scenes/*.npz",
+        os.path.expanduser("~/superv_Articulation/data/Shape2Motion_gcn/cabinet_simp/val/scenes/*.npz"),
         device
     )
     val_loader = DataLoader(dataset, batch_size=1, shuffle=False)
@@ -269,7 +252,7 @@ def evaluate(checkpoint_path):
         "pointnet_dim": 1024,
         "nlayers": 4,
         "nhidden": 512,
-        "out_dim": 256,
+        "out_dim": 512,
         "dropout": 0.3,
         "lamda": 0.5,
         "alpha": 0.1,
@@ -278,7 +261,7 @@ def evaluate(checkpoint_path):
         "n_class": 1,
         "latent_dim": 1,
         "decoder_out_dim": 128,
-        "motion_decoder_out_dim": 256,
+        "motion_decoder_out_dim": 512,
     }
 
 
@@ -334,7 +317,6 @@ def evaluate(checkpoint_path):
 
 
 if __name__ == "__main__":
-    # chk = "./pre_trained_models_gcnpp/2026-01-27 15_52_25_L.R.W/chkpt_best_model_val.pth"
-    chk = "./pre_trained_models_gcnpp/2026-01-28 13_44_00_L.R.W/chkpt_best_model_val.pth"
+    chk = os.path.expanduser("~/superv_Articulation/pre_trained_models_gcnpp/2026-02-04 20:21:38_C/chkpt_best_model_train.pth")
     metrics = evaluate(chk)
     print(f"\n\n{metrics}")

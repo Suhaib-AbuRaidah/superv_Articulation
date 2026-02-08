@@ -5,7 +5,8 @@ import numpy as np
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 import sys
-sys.path.append('/home/suhaib/superv_Articulation')
+import os
+sys.path.append(os.path.expanduser('~/superv_Articulation'))
 from PointNet2.models.PointNet2_Encoder import get_model as PointNetEncoder
 import open3d as o3d
 class GraphConvolution(nn.Module):
@@ -189,7 +190,6 @@ class DualPointNetGCNII(nn.Module):
         """
         N = len(part_pcs1)
         P = part_pcs1[0].shape[1]
-
         # -------- Per-part batching --------
         pcs1 = torch.cat([pc.transpose(1, 2) for pc in part_pcs1], dim=0)  # [N, 3, P]
         pcs2 = torch.cat([pc.transpose(1, 2) for pc in part_pcs2], dim=0)  # [N, 3, P]
@@ -232,6 +232,8 @@ class DualPointNetGCNII(nn.Module):
 
         # -------- GCN --------
         # h = torch.cat([f12_global, recon], dim=1)  # [N, 4d +2*64 + decoder_out_dim]
+
+        # -------- Connection prediction --------
         parts_conn_out = self.gcn(f12_global, adj)
 
         return parts_conn_out, motion_para_out #, z, recon
