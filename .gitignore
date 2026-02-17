@@ -4,13 +4,13 @@ pre_trained_models*/
 Pairs/
 runs/
 **/*.zip/**
-**/*.svg/**
+**/*.svg
 **/*.drawio/**
 **/*.bkp/**
 **/*.log/**
 **/*.pth/**
 **/*.ckpt/**
-**/*.png/**
+**/*.png
 log*.txt
 **/environment.*/**
 **/__pycache__/**

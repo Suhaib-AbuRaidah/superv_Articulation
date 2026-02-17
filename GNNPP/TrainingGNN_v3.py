@@ -5,7 +5,7 @@ import os
 import sys
 sys.path.append(os.path.expanduser('~/superv_Articulation'))
 from utilis.dataset2 import PartsGraphDataset3, collate_graphs
-from GNNPP.gnn_pointnet2_network_v2 import parts_connection_mlp
+from GNNPP.gnn_pointnet2_network_v3 import parts_connection_mlp
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from utilis.Visualizer import VisualizerWrapper
@@ -53,6 +53,10 @@ def training_step(model, data_dict):
         parts_start_list,
         pc_ends,
         parts_end_list,
+        pc_start_unsampled,
+        pc_end_unsampled,
+        seg_mask_start_unsampled, 
+        seg_mask_end_unsampled,
         adj,
         parts_connections_gt,
         joint_type_list_gt,
@@ -60,95 +64,174 @@ def training_step(model, data_dict):
         screw_point_list_gt,
         angles,
         file_name,
+        src, dst,
+        edge_dir_gt, edge_dst_gt,
     ) = data_dict
 
     total_loss = 0.0
 
     adj = adj.squeeze()
-    # print(f"adj:\n{adj}")
     parts_connections_gt = parts_connections_gt.squeeze()
-    # print(f"parts_connections_gt:\n{parts_connections_gt}")
-    screw_axis_list_gt = screw_axis_list_gt.squeeze().view(-1,3)
+    # print(f"adj:\n{adj}")
+    # print(f"parts_conne_gt:\n{parts_connections_gt}")
+    screw_axis_list_gt = screw_axis_list_gt.squeeze().view(-1, 3)
     screw_axis_list_gt = F.normalize(screw_axis_list_gt, dim=1)
-    # screw_axis_list_gt = canonical_direction(screw_axis_list_gt)
-    # print(f"screw_axis_list_gt:\n{screw_axis_list_gt}")
-    screw_point_list_gt = screw_point_list_gt.squeeze().view(-1,3)
+
+    screw_point_list_gt = screw_point_list_gt.squeeze().view(-1, 3)
     joint_type_list_gt = joint_type_list_gt.squeeze()
-    angles = angles.squeeze().view(-1,1)
+
+    # keep GT edge projection tensors as-is (do NOT reshape to (-1,3) / flatten)
+    # expected (E, P_edge, 3) and (E, P_edge, 1) or (E, P_edge)
+    edge_dir_gt = edge_dir_gt.squeeze(0)
+    edge_dst_gt = edge_dst_gt.squeeze(0)
+
+    angles = angles.squeeze().view(-1, 1)
+
     # Forward pass
     edges_conne_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, (src, dst) = model(parts_start_list, parts_end_list, adj)
+
     edges_conne_pred = edges_conne_pred.mean(dim=1)
     joint_type_pred = joint_type_pred.mean(dim=1)
+
     conn_gt = parts_connections_gt[src, dst].float().unsqueeze(1)  # [num_edges, 1]
-    # print(f"conn_gt:\n{conn_gt}")
-    # loss_latent = F.mse_loss(z, angles, reduction='mean')
-    # print(f"parts connections pred:\n{edges_conne_pred}")
+
     loss_part_conn = F.binary_cross_entropy_with_logits(edges_conne_pred, conn_gt, reduction='sum')
+    # print(f"edges_conne_pred:\n{edges_conne_pred}")                # -------- Local feature augmentation --------
+    # print(f"conn_gt:\n{conn_gt}\n")
+    # print(f"loss_part_conn:\n{loss_part_conn}")
     joint_mask = conn_gt.squeeze(1) > 0  # boolean mask of edges that exist
     if joint_mask.sum() > 0:
         joint_type_pred_valid = joint_type_pred[joint_mask]
-        joint_type_list_gt = joint_type_list_gt.reshape(-1,1)
+        joint_type_list_gt = joint_type_list_gt.reshape(-1, 1)
+        # print(f"joint_type_pred_valid:\n{joint_type_pred_valid}")
+        # print(f"joint_type_list_gt:\n{joint_type_list_gt}\n")
         loss_joint_type = F.binary_cross_entropy_with_logits(joint_type_pred_valid, joint_type_list_gt, reduction='sum')
+        # print(f"loss_joint_type:\n{loss_joint_type}")
     else:
         loss_joint_type = torch.tensor(0.0, device=adj.device)
 
     revolute_mask = (joint_type_list_gt == 0)  # 0 = revolute
     prismatic_mask = (joint_type_list_gt == 1)  # 1 = prismatic
-    # print(f"Prismatic Mask: {prismatic_mask}")
-    # Compute per-edge parameter losses (L2)
-    revolute_axis_pred = revolute_para_pred[:,:,:3][joint_mask].squeeze()
-    rev_weights = torch.sigmoid(revolute_para_pred[:,:,3:4][joint_mask])
+
+    # Revolute axis prediction (unchanged)
+    revolute_axis_pred = revolute_para_pred[:, :, :3][joint_mask].squeeze()
+    rev_weights = torch.sigmoid(revolute_para_pred[:, :, 3:4][joint_mask])
     revolute_axis_pred = (revolute_axis_pred * rev_weights).sum(dim=1) / (rev_weights.sum(dim=1) + 1e-6)
     revolute_axis_pred = F.normalize(revolute_axis_pred, dim=1)
-    
-    revolute_pivot_pred = revolute_para_pred[:,:,4:7][joint_mask].squeeze()
-    rev_pivot_weights = torch.sigmoid(revolute_para_pred[:,:,7:8][joint_mask])
-    revolute_pivot_pred = (revolute_pivot_pred * rev_pivot_weights).sum(dim=1) / (rev_pivot_weights.sum(dim=1) + 1e-6)
-    # print(f"revolute_axis_pred before:\n{revolute_axis_pred}")
 
-    # revolute_axis_pred = canonical_direction(revolute_axis_pred)
-    # print(f"revolute_axis_pred after:\n{revolute_axis_pred}") 
-    prismatic_axis_pred = prismatic_para_pred[:,:,:3][joint_mask].squeeze()
-    pri_weights = torch.sigmoid(prismatic_para_pred[:,:,3:4][joint_mask])
+    # --- ADDED: pivot projection direction + distance losses (paper-style) ---
+    # Predicted projection direction d_p and signed distance h_p (per-point)
+    edge_dir_pred = revolute_para_pred[:, :, 4:7][joint_mask]              # (E_joint, P_edge, 3)
+    edge_dir_pred = F.normalize(edge_dir_pred, dim=-1)
+
+    edge_dst_pred = revolute_para_pred[:, :, 7:8][joint_mask]              # (E_joint, P_edge, 1)
+
+
+    # GT for the same edges (upper-tri ordering). Keep only existing edges, Distribu
+    edge_dir_gt_j = edge_dir_gt[joint_mask]                                # (E_joint, P_edge, 3)
+    edge_dst_gt_j = edge_dst_gt[joint_mask]                                # (E_joint, P_edge, 1) or (E_joint, P_edge)
+
+    if edge_dst_gt_j.dim() == 2:
+        edge_dst_gt_j = edge_dst_gt_j.unsqueeze(-1)
+
+
+    # parts_start_list: list of (1,P,3) or (P,3) tensors (as used in your codebase)
+    pcs1 = torch.cat([pc.transpose(1, 2) for pc in parts_start_list], dim=0)        # (N,3,P)
+
+    # build per-edge union points (E,2P,3)
+    edge_points = torch.cat([pcs1[src], pcs1[dst]], dim=2).transpose(1, 2)          # (E,2P,3)
+    edge_points = edge_points[joint_mask]                                           # (E_joint,2P,3)
+
+    # predicted per-point footpoint on/near axis: q = p + h*d
+    edge_pivot_per_point = edge_points + edge_dir_pred * edge_dst_pred              # (E_joint,2P,3)
+    # ground truth per-point footpoint on/near axis: q_gt = p + h_gt*d_gt
+    edge_pivot_per_point_gt = edge_points + edge_dir_gt_j * edge_dst_gt_j   # (E_joint,2P,3)
+
+
+    # --- Approach 2: cross-part closest point (A -> B and B -> A) ---
+    P = edge_points.shape[1] // 2
+    pc_A, pc_B = edge_points[:, :P, :], edge_points[:, P:, :]                       # (E_joint,P,3)
+    q_A, q_B   = edge_pivot_per_point[:, :P, :], edge_pivot_per_point[:, P:, :]     # (E_joint,P,3)
+
+    D_A = torch.cdist(q_A, pc_B)                                                    # (E_joint,P,P)
+    D_B = torch.cdist(q_B, pc_A)                                                    # (E_joint,P,P)
+
+    min_dist_A, _ = D_A.min(dim=2)                                                  # (E_joint,P)
+    min_dist_B, _ = D_B.min(dim=2)                                                  # (E_joint,P)
+
+    # per-edge loss (E_joint,)
+    cross_min_dist = 0.5 * (min_dist_A.mean(dim=1) + min_dist_B.mean(dim=1))
+    # print(f"cross_min_dist:\n{cross_min_dist}")
+
+    pivot_consistancy_loss = cross_min_dist
+
+    rev_edge_pivots = edge_pivot_per_point.mean(dim=1)  # (E_joint, 3)
+    rev_edge_pivots_gt = edge_pivot_per_point_gt.mean(dim=1)  # (E_joint, 3)
+
+    pivot_hard_loss = torch.sqrt(F.mse_loss(rev_edge_pivots, rev_edge_pivots_gt, reduction='none')).mean(dim=1)  # (E_joint,)
+    # print(f"pivot_hard_loss:\n{pivot_hard_loss}")
+
+    # Direction loss: arccos(d · d̂)
+    cos_sim = torch.sum(edge_dir_pred * edge_dir_gt_j, dim=-1)             # (E_joint, P_edge)
+    cos_sim = torch.clamp(cos_sim, -1.0 + 1e-6, 1.0 - 1e-6)
+    loss_pivot_dir = torch.acos(cos_sim).mean(dim=1)                       # (E_joint,)
+
+    # print(f"loss_pivot_dir:\n{loss_pivot_dir}")
+    # Distance loss: |h - ĥ|
+    loss_pivot_dst = torch.abs(edge_dst_pred - edge_dst_gt_j).squeeze(-1)  # (E_joint, P_edge)
+    loss_pivot_dst = loss_pivot_dst.mean(dim=1)                            # (E_joint,)
+    # print(f"loss_pivot_dst:\n{loss_pivot_dst}")
+
+
+    # revolute_pivot_loss = loss_pivot_dir + loss_pivot_dst + pivot_consistancy_loss + pivot_hard_loss    # (E_joint,)
+    revolute_pivot_loss = loss_pivot_dir + loss_pivot_dst + pivot_hard_loss    # (E_joint,)
+    # ----------------------------------------------------------------------
+
+    # Prismatic axis prediction (unchanged)
+    prismatic_axis_pred = prismatic_para_pred[:, :, :3][joint_mask].squeeze()
+    pri_weights = torch.sigmoid(prismatic_para_pred[:, :, 3:4][joint_mask])
     prismatic_axis_pred = (prismatic_axis_pred * pri_weights).sum(dim=1) / (pri_weights.sum(dim=1) + 1e-6)
     prismatic_axis_pred = F.normalize(prismatic_axis_pred, dim=1)
-    # prismatic_axis_pred = canonical_direction(prismatic_axis_pred)
-    # print(f"prismatic_axis_pred:\n{prismatic_axis_pred}")
-    # revolute_axis_loss = torch.sqrt(F.mse_loss(revolute_axis_pred, screw_axis_list_gt, reduction='none').clamp(min=1e-12)).mean(1)
-    revolute_axis_loss = 1-torch.abs(torch.sum(revolute_axis_pred * screw_axis_list_gt, dim=1)).mean()
-    # revolute_pivot_loss = torch.sqrt(F.mse_loss(revolute_pivot_pred, screw_point_list_gt, reduction='none').clamp(min=1e-12)).mean(1)
-    revolute_pivot_loss = point_to_axis_distance(revolute_pivot_pred, screw_point_list_gt, screw_axis_list_gt)
+
+    # print(f"revolute_axis_pred:\n{revolute_axis_pred}")
+    # print(f"screw_axis_list_gt:\n{screw_axis_list_gt[revolute_mask.squeeze(1)]}\n")
+    revolute_axis_loss = 1 - torch.abs(torch.sum(revolute_axis_pred * screw_axis_list_gt, dim=1)).mean()
+    # print(f"revolute_axis_loss:\n{revolute_axis_loss}\n")
     revolute_loss = revolute_axis_loss + revolute_pivot_loss
 
-    # prismatic_loss = torch.sqrt(F.mse_loss(prismatic_axis_pred, screw_axis_list_gt, reduction='none').clamp(min=1e-12)).mean(1)
-    prismatic_loss = 1-torch.abs(torch.sum(prismatic_axis_pred * screw_axis_list_gt, dim=1)).mean()
-    # Apply masks
-
+    # print(f"prismatic_axis_pred:\n{prismatic_axis_pred}")
+    # print(f"screw_axis_list_gt:\n{screw_axis_list_gt[prismatic_mask.squeeze(1)]}\n")
+    prismatic_loss = 1 - torch.abs(torch.sum(prismatic_axis_pred * screw_axis_list_gt, dim=1)).mean()
+    # print(f"prismatic_loss:\n{prismatic_loss}\n")
+    # Apply masks (keep your structure; revolute_pivot_loss is per-edge now)
     revolute_loss = (revolute_loss * revolute_mask.float().view(-1))
     revolute_loss = revolute_loss.mean()
+
     revolute_axis_loss = (revolute_axis_loss * revolute_mask.float().view(-1))
     revolute_axis_loss = revolute_axis_loss.mean()
+
     revolute_pivot_loss = (revolute_pivot_loss * revolute_mask.float().view(-1))
     revolute_pivot_loss = revolute_pivot_loss.mean()
 
     prismatic_loss = (prismatic_loss * prismatic_mask.float().view(-1))
     prismatic_loss = prismatic_loss.mean()
-    
-    total_loss = loss_part_conn + loss_joint_type + revolute_loss + prismatic_loss #+ loss_latent
-    # print(f"Losses: total={total_loss.item():.4f}, conn={loss_part_conn.item():.4f}, type={loss_joint_type.item():.4f}, revolute={revolute_loss.item():.4f}, prismatic={prismatic_loss.item():.4f}, latent={loss_latent.item():.4f}")
-    return total_loss, loss_part_conn, loss_joint_type, revolute_loss, revolute_axis_loss, revolute_pivot_loss, prismatic_loss #, loss_latent
+
+    total_loss = loss_part_conn + loss_joint_type + revolute_loss + prismatic_loss
+    return total_loss, loss_part_conn, loss_joint_type, revolute_loss, revolute_axis_loss, revolute_pivot_loss, prismatic_loss
+
 
 
 
 # --- 4. Training Step ---
+
 torch.manual_seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 train_dataset = PartsGraphDataset3(os.path.expanduser("~/superv_Articulation/data/Shape2Motion_gcn/cabinet_simp/train/scenes/*.npz"),device)
 val_dataset = PartsGraphDataset3(os.path.expanduser("~/superv_Articulation/data/Shape2Motion_gcn/cabinet_simp/val/scenes/*.npz"),device)
 
 train_dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True)
 val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False)
-
 
 start_training_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 checkpoint_path = f"~/superv_Articulation/pre_trained_models_gcnpp/{start_training_time}_C"
@@ -166,15 +249,19 @@ params = {
     "lamda": 0.5,
     "alpha": 0.1,
     "variant": True,
-    "nhidden_mlp": 256,
+    "nhidden_mlp": 512,
     "n_class": 1,
     "latent_dim": 1,
     "decoder_out_dim": 128,
-    "motion_decoder_out_dim": 512,
+    "motion_decoder_out_dim": 128,
 }
 
-model = parts_connection_mlp(**params).cuda()
+model = parts_connection_mlp(**params).to(device)
 
+# Count trainable parameters only
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f'Trainable parameters: {trainable_params:,}')
+# model.load_state_dict(torch.load(os.path.expanduser("~/superv_Articulation/pre_trained_models_gcnpp/2026-02-11 01:36:33_C/chkpt_best_model_train.pth")))
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=LR_DECAY_STEP, gamma=LR_DECAY_GAMMA)
 model.train()
@@ -184,7 +271,7 @@ best_loss_train = float('inf')
 best_loss_val = float('inf')
 
 
-for epoch in range(200):
+for epoch in range(EPOCHS):
     current_lr = scheduler.get_last_lr()[0]
     print(f"\n=== Epoch {epoch+1} | LR: {current_lr:.6f} ===")
     epoch_loss = 0.0

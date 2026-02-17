@@ -369,12 +369,12 @@ class PartsGraphDataset3(Dataset):
 
             pc_start = data["pc_start"].astype(np.float32)  # (N,3)
             pc_end = data["pc_end"].astype(np.float32)      # (N,3)
-
-            adjacency_matrix = data["adj"].astype(np.float32)
-            parts_conne_gt_np = data["parts_conne_gt"].astype(np.float32)
-
             seg_mask_start = data["pc_seg_start"].item()  # dict-like
             seg_mask_end = data["pc_seg_end"].item()
+            pc_start_unsampled, seg_mask_start_unsampled = self.downsample_pc_masks(pc_start, seg_mask_start, 25000)
+            pc_end_unsampled, seg_mask_end_unsampled = self.downsample_pc_masks(pc_end, seg_mask_end, 25000)   
+            adjacency_matrix = data["adj"].astype(np.float32)
+            parts_conne_gt_np = data["parts_conne_gt"].astype(np.float32)
 
             joint_type_list = np.array(data["joint_type"], dtype=np.float32)
             screw_axis_list = np.array(data["screw_axis"], dtype=np.float32)
@@ -400,6 +400,8 @@ class PartsGraphDataset3(Dataset):
 
             pc_start = (pc_start - center) / scale
             pc_end = (pc_end - center) / scale
+            pc_start_unsampled = (pc_start_unsampled - center) / scale
+            pc_end_unsampled = (pc_end_unsampled - center) / scale
 
             # Build screw points on axis from (axis, moment): q = axis x moment
             screw_point_list = []
@@ -430,6 +432,8 @@ class PartsGraphDataset3(Dataset):
             # --- Precompute edge-wise GT projection (both parts concatenated) ---
             # Upper-triangular edges
             src_ut, dst_ut = np.triu_indices(num_parts, k=1)
+            mask = adjacency_matrix[src_ut, dst_ut] != 0
+            src_ut, dst_ut = src_ut[mask], dst_ut[mask]
             E = src_ut.shape[0]
             P = self.num_part_points
 
@@ -463,11 +467,14 @@ class PartsGraphDataset3(Dataset):
 
                     counter += 1
                 # else remains zeros (non-edge)
+            
+
 
             # Torch conversions
             pc_start_t = torch.tensor(pc_start, dtype=torch.float32, device=device)
             pc_end_t = torch.tensor(pc_end, dtype=torch.float32, device=device)
-
+            pc_start_unsampled = torch.tensor(pc_start_unsampled, dtype=torch.float32, device=device)
+            pc_end_unsampled = torch.tensor(pc_end_unsampled, dtype=torch.float32, device=device)
             joints_type_t = torch.tensor(joint_type_list, dtype=torch.float32, device=device)
             joints_screw_axis_t = torch.tensor(screw_axis_list_norm, dtype=torch.float32, device=device)
             joints_screw_point_t = torch.tensor(screw_point_list, dtype=torch.float32, device=device)
@@ -484,6 +491,8 @@ class PartsGraphDataset3(Dataset):
             data_tuple = (
                 pc_start_t, parts_start_list,
                 pc_end_t, parts_end_list,
+                pc_start_unsampled, pc_end_unsampled,
+                seg_mask_start_unsampled, seg_mask_end_unsampled,
                 adjacency_t, parts_conne_gt_t,
                 joints_type_t, joints_screw_axis_t, joints_screw_point_t,
                 angles_t, file_name,

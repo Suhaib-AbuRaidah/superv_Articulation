@@ -4,8 +4,11 @@ import math
 import numpy as np
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
-from GNNPP.gnn_PointNetEncoder import PointNetEncoder
-
+import sys
+import os
+sys.path.append(os.path.expanduser('~/superv_Articulation'))
+from PointNet2.models.PointNet2_Encoder import get_model as PointNetEncoder
+import open3d as o3d
 class GraphConvolution(nn.Module):
 
     def __init__(self, in_features, out_features, residual=False, variant=False):
@@ -100,10 +103,19 @@ class CrossAttention(nn.Module):
         self.scale = math.sqrt(d)
 
     def forward(self, f1, f2):
-        # f1, f2: [N, d]
-        attn = torch.softmax((f1 @ f2.T) / self.scale, dim=-1)  # [N, N]
-        out = attn @ f2  # [N, d]
-        return torch.cat([f1, out], dim=1)  # [N, 2d]
+        # support both 2D [N,d] and 3D [B,N,d]
+        if f1.dim() == 2:
+            attn = torch.softmax((f1 @ f2.T) / self.scale, dim=-1)
+            out = attn @ f2
+            return torch.cat([f1, out], dim=1)
+        elif f1.dim() == 3:
+            # f1, f2: [B, N, d]
+            attn = torch.softmax(torch.matmul(f1, f2.transpose(-2, -1)) / self.scale, dim=-1)  # [B,N,N]
+            out = torch.matmul(attn, f2)  # [B,N,d]
+            return torch.cat([f1, out], dim=-1)  # [B,N,2d]
+        else:
+            raise ValueError("Unsupported tensor dims for CrossAttention")
+
 
 class FeatureAutoEncoder(nn.Module):
     def __init__(self, in_dim, latent_dim=1,decoder_out_dim=128):
@@ -126,51 +138,126 @@ class FeatureAutoEncoder(nn.Module):
 
 
 class DualPointNetGCNII(nn.Module):
-    def __init__(self, pointnet_out_dim, nlayers, nhidden, out_dim,
-                 dropout, lamda, alpha, variant, latent_dim, decoder_out_dim):
+    def __init__(self, pointnet_out_dim, nlayers, nhidden, out_dim, dropout,
+                 lamda, alpha, variant, latent_dim, decoder_out_dim, motion_decoder_out_dim):
         super().__init__()
 
-        # Two separate PointNet encoders
-        self.pointnet1 = PointNetEncoder(out_dim=pointnet_out_dim)
-        self.pointnet2 = PointNetEncoder(out_dim=pointnet_out_dim)
+        d = pointnet_out_dim
+        local_dim = 64
 
-        # Attention: input d → output 2d
-        self.attn = CrossAttention(pointnet_out_dim)
+        # PointNet encoders
+        self.pointnet_p1_enc = PointNetEncoder()
+        self.pointnet_p2_enc = PointNetEncoder()
 
-        # Autoencoder: input 2d → latent_dim
-        self.ae = FeatureAutoEncoder(2 * pointnet_out_dim, latent_dim=latent_dim,decoder_out_dim=decoder_out_dim)
+        # Motion parameter decoder (per part)
+        self.motion_decoder = nn.Sequential(
+            nn.Linear(4*d + 2*local_dim, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, motion_decoder_out_dim),
+        )
 
-        # Final GCN input = attn_out (2d) + latent (128)
-        gcn_in_dim = 2 * pointnet_out_dim + decoder_out_dim
+        self.connection_decoder = nn.Sequential(
+            nn.Linear(4*d + 2*local_dim, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, motion_decoder_out_dim),
+        )
 
-        self.gcn = GCNII(nfeat=gcn_in_dim, nlayers=nlayers,
-                         nhidden=nhidden, out_dim=out_dim,
-                         dropout=dropout, lamda=lamda,
-                         alpha=alpha, variant=variant)
+        self.joint_type_decoder = nn.Sequential(
+            nn.Linear(4*d + 2*local_dim, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, motion_decoder_out_dim),
+        )
+        # Cross-attention modules
+        self.attn_parts_conn = CrossAttention(2 * d)
+        self.attn_parts_conn_local = CrossAttention(2 * d + local_dim)
+        self.attn_motion_param = CrossAttention(2 * d + local_dim)
+
+        # # Autoencoder
+        # self.ae = FeatureAutoEncoder(
+        #     in_dim=4 * d,
+        #     latent_dim=latent_dim,
+        #     decoder_out_dim=decoder_out_dim
+        # )
+
+        # GCN
+        gcn_in_dim = 4 * d #+ decoder_out_dim
+        self.gcn = GCNII(
+            nfeat=gcn_in_dim,
+            nlayers=nlayers,
+            nhidden=nhidden,
+            out_dim=out_dim,
+            dropout=dropout,
+            lamda=lamda,
+            alpha=alpha,
+            variant=variant
+        )
+
 
     def forward(self, part_pcs1, part_pcs2, adj):
-        # 1. Extract PointNet features for pose1 & pose2
-        pcs1 = torch.concat([pc.transpose(1,2) for pc in part_pcs1], 0)
-        pcs2 = torch.concat([pc.transpose(1,2) for pc in part_pcs2], 0)
+        """
+        part_pcs1, part_pcs2: list of tensors, each [P, 3]
+        adj: [N, N]
+        """
+        N = len(part_pcs1)
+        P = part_pcs1[0].shape[1]
+        # -------- Per-part batching --------
+        pcs1 = torch.cat([pc.transpose(1, 2) for pc in part_pcs1], dim=0)  # [N, 3, P]
+        pcs2 = torch.cat([pc.transpose(1, 2) for pc in part_pcs2], dim=0)  # [N, 3, P]
+   
+        # -------- Whole-object batching --------
+        total_object_1 = torch.cat([pc.transpose(1, 2) for pc in part_pcs1], dim=2)  # [1, 3, N·P]
+        total_object_2 = torch.cat([pc.transpose(1, 2) for pc in part_pcs2], dim=2)  # [1, 3, N·P]
 
-        f1,_,_ = self.pointnet1(pcs1)  # [N, d]
-        f2,_,_ = self.pointnet2(pcs2)  # [N, d]
+        # -------- PointNet encoding --------
+        f1_global, f1_local = self.pointnet_p1_enc(pcs1)  # [N, d], [N, d+64, P]
+        f2_global, f2_local = self.pointnet_p2_enc(pcs2)
 
-        # 2. Cross Attention (fusion)
-        f12 = self.attn(f1, f2)        # [N, 2d]
-        # 3. Autoencoder
-        z, recon = self.ae(f12)        # recon: [N,128]
-        # 4. Concatenate fused features with latent
-        h = torch.cat([f12, recon], dim=1) # [N, 2d + 128]
+        obj1_global, _ = self.pointnet_p1_enc(total_object_1)  # [1, d]
+        obj2_global, _ = self.pointnet_p2_enc(total_object_2)
+        
+        # -------- Global feature augmentation --------
+        obj1_global_rep = obj1_global.repeat(N, 1)
+        obj2_global_rep = obj2_global.repeat(N, 1)
 
-        # 5. GCN
-        out = self.gcn(h, adj)
+        f1_global = torch.cat([f1_global, obj1_global_rep], dim=1)  # [N, 2d]
+        f2_global = torch.cat([f2_global, obj2_global_rep], dim=1)  # [N, 2d]
 
-        return out, z, recon
+        # -------- Local feature augmentation --------
+        obj1_global_exp = obj1_global.unsqueeze(2).repeat(N, 1, P)  # [N, d, P]
+        obj2_global_exp = obj2_global.unsqueeze(2).repeat(N, 1, P)  # [N, d, P]
 
+        f1_local = torch.cat([f1_local, obj1_global_exp], dim=1)  # [N, 2d+64, P]
+        f2_local = torch.cat([f2_local, obj2_global_exp], dim=1)  # [N, 2d+64, P]
 
+        # -------- Cross-attention --------
+        f12_global = self.attn_parts_conn(f1_global, f2_global)  # [N, 4d+2*64]
+        f12_local_kinematics = self.attn_parts_conn_local(
+            f1_local.transpose(1, 2),  # [N, P, 2d+64]
+            f2_local.transpose(1, 2)   # [N, P, 2d+64] 
+        )  # [N, P, 4d+2*64]
+        
+        f12_local_motion = self.attn_motion_param(
+            f1_local.transpose(1, 2),  # [N, P, 2d+64]
+            f2_local.transpose(1, 2)   # [N, P, 2d+64] 
+        )  # [N, P, 4d+2*64]
 
-    
+        # -------- Motion prediction --------
+        motion_para_out = self.motion_decoder(f12_local_motion) # [N, P, motion_decoder_out_dim]
+
+        # -------- Connection prediction --------
+        connection_para_local = self.connection_decoder(f12_local_kinematics) # [N, P, connection_decoder_out_dim]
+        joint_type_decoder = self.joint_type_decoder(f12_local_kinematics) # [N, P, joint_type_decoder_out_dim]
+        parts_conn_out = self.gcn(f12_global, adj).unsqueeze(1).repeat(1, P, 1)
+        conn_out = torch.cat([parts_conn_out, connection_para_local], dim=2)  # [N, P, out_dim + connection_decoder_out_dim]
+        joint_type_out = torch.cat([parts_conn_out, joint_type_decoder], dim=2)  # [N, P, out_dim + joint_type_decoder_out_dim]
+        return conn_out, joint_type_out, motion_para_out, 
+
 
 class parts_connection_mlp(nn.Module):
     def __init__(self, **kwargs):
@@ -186,65 +273,93 @@ class parts_connection_mlp(nn.Module):
             kwargs["variant"],
             kwargs["latent_dim"],
             kwargs["decoder_out_dim"],
+            kwargs["motion_decoder_out_dim"],
         )
 
         # MLP for edge existence (binary-classification)
         self.part_conn_mlp = nn.Sequential(
-            nn.Linear(2 * kwargs["out_dim"], kwargs["nhidden_mlp"]),
+            nn.Linear(2 * (kwargs["out_dim"]+kwargs["motion_decoder_out_dim"]), kwargs["nhidden_mlp"]),
             nn.Dropout(kwargs["dropout"]),
             nn.ReLU(),
-            nn.Linear(kwargs["nhidden_mlp"], kwargs["n_class"]), #{connection, no-connection}
+            nn.Linear(kwargs["nhidden_mlp"], kwargs["nhidden_mlp"]//2),
+            nn.ReLU(),
+            nn.Linear(kwargs["nhidden_mlp"]//2, kwargs["n_class"]), #{connection, no-connection}
         )
 
         # MLP for joint type classification (binary-classification)
         self.joint_type_mlp = nn.Sequential(
-            nn.Linear(2 * kwargs["out_dim"], kwargs["nhidden_mlp"]),
+            nn.Linear(2 * (kwargs["out_dim"]+kwargs["motion_decoder_out_dim"]), kwargs["nhidden_mlp"]),
             nn.Dropout(kwargs["dropout"]),
             nn.ReLU(),
-            nn.Linear(kwargs["nhidden_mlp"], 1),  # {revolute, prismatic}
+            nn.Linear(kwargs["nhidden_mlp"], kwargs["nhidden_mlp"]//2),
+            nn.ReLU(),
+            nn.Linear(kwargs["nhidden_mlp"]//2, kwargs["n_class"]),  # {revolute, prismatic}
         )
 
         self.revolute_mlp = nn.Sequential(
-            nn.Linear(2 * kwargs["out_dim"], kwargs["nhidden_mlp"]),
+            nn.Linear(2*kwargs["motion_decoder_out_dim"], kwargs["nhidden_mlp"]),
             nn.Dropout(kwargs["dropout"]),
             nn.ReLU(),
-            nn.Linear(kwargs["nhidden_mlp"], 3),
+            nn.Linear(kwargs["nhidden_mlp"], kwargs["nhidden_mlp"]//2),
+            nn.ReLU(),
+            nn.Linear(kwargs["nhidden_mlp"]//2, 8),
         )
 
         self.prismatic_mlp = nn.Sequential(
-            nn.Linear(2 * kwargs["out_dim"], kwargs["nhidden_mlp"]),
+            nn.Linear(2*kwargs["motion_decoder_out_dim"], kwargs["nhidden_mlp"]),
             nn.Dropout(kwargs["dropout"]),
             nn.ReLU(),
-            nn.Linear(kwargs["nhidden_mlp"], 3),
+            nn.Linear(kwargs["nhidden_mlp"], kwargs["nhidden_mlp"]//2),
+            nn.ReLU(),
+            nn.Linear(kwargs["nhidden_mlp"]//2, 4),
         )
 
-                      
+        self.revolute_mlp2 = nn.Sequential(
+            nn.Linear(kwargs["motion_decoder_out_dim"], kwargs["nhidden_mlp"]),
+            nn.Dropout(kwargs["dropout"]),
+            nn.ReLU(),
+            nn.Linear(kwargs["nhidden_mlp"], kwargs["nhidden_mlp"]//2),
+            nn.ReLU(),
+            nn.Linear(kwargs["nhidden_mlp"]//2, 8),
+        )
+
+        self.prismatic_mlp2 = nn.Sequential(
+            nn.Linear(kwargs["motion_decoder_out_dim"], kwargs["nhidden_mlp"]),
+            nn.Dropout(kwargs["dropout"]),
+            nn.ReLU(),
+            nn.Linear(kwargs["nhidden_mlp"], kwargs["nhidden_mlp"]//2),
+            nn.ReLU(),
+            nn.Linear(kwargs["nhidden_mlp"]//2, 4),
+        )
+
     def forward(self, part_pointclouds_start, part_pointclouds_end, adj):
         # Node embeddings
-        h,z,_ = self.pointnetgcn(part_pointclouds_start, part_pointclouds_end, adj)  # [N, out_dim]
+        h_conn, h_joint_type, h_motion = self.pointnetgcn(part_pointclouds_start, part_pointclouds_end, adj)  # [N, out_dim]
 
         N = adj.size(0)
+        device = adj.device
         # Get indices of upper triangle (excluding diagonal)
-        src, dst = torch.triu_indices(N, N, offset=1)
-        
+        src, dst = torch.triu_indices(N, N, offset=1).to(device)
+
         # Filter only where there is an edge
         mask = adj[src, dst] != 0
         src, dst = src[mask], dst[mask]
 
-        # Concatenate embeddings
-        edge_feats = torch.cat([h[src], h[dst]], dim=1)  # [num_edges, 2*out_dim]
-
+        # create per-edge connection and motion features by concatenating node motion embeddings
+        edge_conn_feats = torch.cat([h_conn[src], h_conn[dst]], dim=2)  # [num_edges, 2*(out_dim+connection_decoder_out_dim)]
+        edge_joint_type_feats = torch.cat([h_joint_type[src], h_joint_type[dst]], dim=2)  # [num_edges, 2*(out_dim+joint_type_decoder_out_dim)]
+        # edge_motion_feats = torch.cat([h_motion[src], h_motion[dst]], dim=2)  # [num_edges, P, 2*motion_decoder_out_dim]
+        edge_motion_feats = torch.cat([h_motion[src], h_motion[dst]], dim=1)  # [num_edges, 2P, motion_decoder_out_dim]
         # Predict edge connection (binary)
-        edge_pred = self.part_conn_mlp(edge_feats)  # [num_edges, 1]
+        edge_pred = self.part_conn_mlp(edge_conn_feats)  # [num_edges, P, 1]
+        # Predict joint type (binary)
+        joint_type_pred = self.joint_type_mlp(edge_joint_type_feats)  # [num_edges, P, 1]
+        # Predict motion parameters for revolute joints
+        revolute_para_pred = self.revolute_mlp2(edge_motion_feats) # [num_edges, P, 8]
+        # Predict motion parameters for prismatic joints
+        prismatic_para_pred = self.prismatic_mlp2(edge_motion_feats) # [num_edges, P, 4]
 
-        # Predict joint type (multi-class)
-        joint_type_pred = self.joint_type_mlp(edge_feats)  # [num_edges, 1]
-
-        revolute_para_pred = self.revolute_mlp(edge_feats)
-
-        prismatic_para_pred = self.prismatic_mlp(edge_feats)
-
-        return edge_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, z, (src, dst)
+        return edge_pred, joint_type_pred, revolute_para_pred, prismatic_para_pred, (src, dst)
 
     
     
