@@ -1,89 +1,149 @@
-import torch
-import networkx as nx
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
 from matplotlib.patches import Patch
+from graphviz import Graph
+import torch
 
-def visualize_articulated_graph(joint_conne_pred, adj, joint_types_pred, screw_axes_pred,
-                                img=None,threshold=0.5, node_labels=None, figsize=(12, 8)):
+
+def visualize_articulated_graph(
+    joint_conne_pred, adj,
+    img=None, threshold=0.5,
+    node_labels=None, figsize=(12, 8),
+    out_prefix="articulated_graph"
+):
+
+    # ---- to numpy ----
     joint_conne_pred = joint_conne_pred.detach().cpu().numpy()
+    adj_np = adj.detach().cpu().numpy() if hasattr(adj, "detach") else np.asarray(adj)
     N = joint_conne_pred.shape[0]
-    edges = []
-    edge_labels = {}
-    edge_count = 0
 
-
-    G = nx.Graph()
-    G.add_nodes_from(range(N))
-    G1 = nx.Graph()
-    G1.add_nodes_from(range(N))
     if node_labels is None:
         node_labels = [f"P{i}" for i in range(N)]
 
-    for i in range(N):
-        for j in range(i+1, N):
-            if adj[i, j] > threshold:
-                G1.add_edge(i, j)
 
-
-    for i in range(N):
-        for j in range(i+1, N):
-            if joint_conne_pred[i, j] >= threshold:
-                G.add_edge(i, j)
-                joint_type = joint_types_pred[edge_count].item()
-                screw_axis = screw_axes_pred[edge_count].detach().cpu().numpy()
-                jt_label = "P" if joint_type >= 0.5 else "R"
-                axis_str = np.array2string(screw_axis, precision=2, suppress_small=True, separator=", ")
-                edge_labels[(i, j)] = f"{jt_label}\n{axis_str}"
-                edge_count += 1
-
-    colors = [
-        (1, 0, 0),      # red
-        (0, 1, 0),      # green
-        (0, 0, 1),      # blue
-        (1, 1, 0),      # yellow
-        (1, 0, 1),      # magenta
-        (0, 1, 1),      # cyan
-        (0.5, 0.5, 0.5), # gray
-        (0.8, 0.5, 0.2),  # orange
-        (0.6, 0.2, 0.8),  # purple
-        (0.2, 0.8, 0.5)  # teal
+    # Graphviz paper-style palette
+    gv_palette = [
+        "#d62728",  # red
+        "#17becf",  # cyan
+        "#1f77b4",  # blue
+        "#9467bd",  # purple
+        "#2ca02c",   # green
+        "#e377c2",  # pink
+        "#8c564b",  # brown
+        "#ff7f0e",  # orange
+        "#7f7f7f",  # gray
     ]
-    labels = [f"P{i}" for i in range(len(colors))]
 
-    # Create legend handles
-    legend_elements = [Patch(facecolor=colors[i], edgecolor='k', label=labels[i]) for i in range(N)]
-    pos = nx.circular_layout(G)
-    pos1 = nx.spring_layout(G1, seed=42)
+    node_colors = [gv_palette[i % len(gv_palette)] for i in range(N)]
 
+    # ---- initial edges ----
+    init_edges = []
+    for i in range(N):
+        for j in range(i + 1, N):
+            if adj_np[i, j] > threshold:
+                init_edges.append((i, j))
 
-    # --- Left: Point Cloud ---
+    # ---- predicted edges ----
+    pred_edges = []
+    for i in range(N):
+        for j in range(i + 1, N):
+            if joint_conne_pred[i, j] >= threshold:
+                pred_edges.append((i, j))
+
+    # ---- helper to render graph ----
+    def render_graphviz_graph(name, engine, edges):
+
+        g = Graph(name=name, engine=engine, format="png",)
+
+        g.attr(
+            "graph",
+            bgcolor="white",
+            overlap="false",
+            splines="true",
+            pad="0.4",
+            sep="+20",        # increase node separation
+            nodesep="0.8",    # horizontal spacing
+            dpi="600"
+        )
+        
+        g.attr(
+            "node",
+            shape="circle",
+            style="filled",
+            color="black",
+            fontname="Helvetica",
+            fontsize="12",
+            width="0.35",
+            height="0.35",            
+            fixedsize="true"
+        )
+
+        g.attr(
+            "edge",
+            color="black",
+            penwidth="1.2"
+        )
+
+        # nodes
+        for i in range(N):
+            g.node(str(i), label=node_labels[i], fillcolor=node_colors[i])
+
+        # edges
+        for (i, j) in edges:
+            g.edge(str(i), str(j))
+
+        png_path = g.render(filename=f"{out_prefix}_{name}", cleanup=True)
+        # svg_path = g.render(filename=f"{out_prefix}_{name}", format="svg", cleanup=True)
+
+        return png_path
+
+    # layouts similar to before
+    init_png = render_graphviz_graph("initial_graph", "neato", init_edges)
+    pred_png = render_graphviz_graph("predicted_graph", "circo", pred_edges)
+
+    # ---- load images ----
+    init_img = mpimg.imread(init_png)
+    pred_img = mpimg.imread(pred_png)
+
+    # legend
+    labels = [f"P{i}" for i in range(min(N, len(node_colors)))]
+    legend_elements = [
+        Patch(facecolor=node_colors[i], edgecolor="k", label=labels[i])
+        for i in range(min(N, len(node_colors)))
+    ]
+
     if img is not None:
-        fig, axes = plt.subplots(1, 3, figsize=figsize, gridspec_kw={"width_ratios": [1.4, 1, 2]})
+        fig, axes = plt.subplots(
+            1, 3, figsize=figsize,
+            gridspec_kw={"width_ratios": [1.4, 1, 1]}
+        )
+
         axes[0].imshow(img)
         axes[0].set_title("Input Point Cloud with Masks", fontsize=16, fontweight="bold")
-        axes[0].legend(handles=legend_elements, loc='center left', bbox_to_anchor=(0.9, 0.5), fontsize=12)
+        axes[0].legend(handles=legend_elements, loc="center left", bbox_to_anchor=(0.9, 0.5))
         axes[0].axis("off")
+
+        axes[1].imshow(init_img)
+        axes[1].set_title("Initial Kinematic Graph", fontsize=16, fontweight="bold")
+        axes[1].axis("off")
+
+        axes[2].imshow(pred_img)
+        axes[2].set_title("Kinematic Graph Prediction", fontsize=16, fontweight="bold")
+        axes[2].axis("off")
+
     else:
-        fig, axes = plt.subplots(1, 2, figsize=figsize, gridspec_kw={"width_ratios": [1, 1]})
-        # axes = [axes[0], axes[1], None]
-    num_axes = 3 if img is not None else 2
+        fig, axes = plt.subplots(1, 2, figsize=figsize,
+                                 gridspec_kw={"width_ratios": [1, 1]}
+                                 )
 
-    # --- Middle: Ground Truth Graph ---
-    nx.draw(G1, pos1, with_labels=True, labels={i: node_labels[i] for i in range(N)},
-            node_size=800, node_color="lightblue", font_size=12, font_weight="bold", ax=axes[num_axes - 2])
+        axes[0].imshow(init_img)
+        axes[0].set_title("Initial Kinematic Graph", fontsize=16, fontweight="bold")
+        axes[0].axis("off")
 
-    axes[num_axes - 2].set_title("Initial Kinematic Graph", fontsize=16, fontweight="bold")
-    axes[num_axes - 2].axis("off")
+        axes[1].imshow(pred_img)
+        axes[1].set_title("Kinematic Graph Prediction", fontsize=16, fontweight="bold")
+        axes[1].axis("off")
 
-    # --- Right: Predicted Graph ---
-    nx.draw(G, pos, with_labels=True, labels={i: node_labels[i] for i in range(N)},
-            node_size=800, node_color="lightblue", font_size=14, font_weight="bold", ax=axes[num_axes - 1])
-    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels,
-                                font_color="darkred", font_size=12, font_weight="bold", ax=axes[num_axes - 1])
-    axes[num_axes - 1].set_title("Kinematic Graph with Articulation Prediction", fontsize=16, fontweight="bold")
-    axes[num_axes - 1].axis("off")
     plt.tight_layout()
-    plt.savefig("articulated_graph.svg")
     plt.show()
-

@@ -166,8 +166,16 @@ class DualPointNetGCNII(nn.Module):
             nn.Linear(512, motion_decoder_out_dim),
         )
 
+        self.joint_type_decoder = nn.Sequential(
+            nn.Linear(4*d + 2*local_dim, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, motion_decoder_out_dim),
+        )
         # Cross-attention modules
         self.attn_parts_conn = CrossAttention(2 * d)
+        self.attn_parts_conn_local = CrossAttention(2 * d + local_dim)
         self.attn_motion_param = CrossAttention(2 * d + local_dim)
 
         # # Autoencoder
@@ -228,20 +236,27 @@ class DualPointNetGCNII(nn.Module):
         f2_local = torch.cat([f2_local, obj2_global_exp], dim=1)  # [N, 2d+64, P]
 
         # -------- Cross-attention --------
-        f12_global = self.attn_parts_conn(f1_global, f2_global)  # [N, 4d+2*64]
-        f12_local = self.attn_motion_param(
+        f12_global = self.attn_parts_conn(f1_global, f2_global)  # [N, 4d]
+        f12_local_kinematics = self.attn_parts_conn_local(
             f1_local.transpose(1, 2),  # [N, P, 2d+64]
             f2_local.transpose(1, 2)   # [N, P, 2d+64] 
         )  # [N, P, 4d+2*64]
+        
+        f12_local_motion = self.attn_motion_param(
+            f1_local.transpose(1, 2),  # [N, P, 2d+64]
+            f2_local.transpose(1, 2)   # [N, P, 2d+64] 
+        )  # [N, P, 4d+2*64]
+
         # -------- Motion prediction --------
-        motion_para_out = self.motion_decoder(f12_local) # [N, P, motion_decoder_out_dim]
+        motion_para_out = self.motion_decoder(f12_local_motion) # [N, P, motion_decoder_out_dim]
 
         # -------- Connection prediction --------
-        connection_para_local = self.connection_decoder(f12_local) # [N, P, connection_decoder_out_dim]
+        connection_para_local = self.connection_decoder(f12_local_kinematics) # [N, P, connection_decoder_out_dim]
+        joint_type_decoder = self.joint_type_decoder(f12_local_kinematics) # [N, P, joint_type_decoder_out_dim]
         parts_conn_out = self.gcn(f12_global, adj).unsqueeze(1).repeat(1, P, 1)
         conn_out = torch.cat([parts_conn_out, connection_para_local], dim=2)  # [N, P, out_dim + connection_decoder_out_dim]
-
-        return conn_out, motion_para_out #, z, recon
+        joint_type_out = torch.cat([parts_conn_out, joint_type_decoder], dim=2)  # [N, P, out_dim + joint_type_decoder_out_dim]
+        return conn_out, joint_type_out, motion_para_out, 
 
 
 class parts_connection_mlp(nn.Module):
@@ -319,24 +334,26 @@ class parts_connection_mlp(nn.Module):
 
     def forward(self, part_pointclouds_start, part_pointclouds_end, adj):
         # Node embeddings
-        h_conn,h_motion = self.pointnetgcn(part_pointclouds_start, part_pointclouds_end, adj)  # [N, out_dim]
+        h_conn, h_joint_type, h_motion = self.pointnetgcn(part_pointclouds_start, part_pointclouds_end, adj)  # [N, out_dim]
 
         N = adj.size(0)
+        device = adj.device
         # Get indices of upper triangle (excluding diagonal)
-        src, dst = torch.triu_indices(N, N, offset=1).cuda()
-        
+        src, dst = torch.triu_indices(N, N, offset=1).to(device)
+
         # Filter only where there is an edge
         mask = adj[src, dst] != 0
         src, dst = src[mask], dst[mask]
 
         # create per-edge connection and motion features by concatenating node motion embeddings
         edge_conn_feats = torch.cat([h_conn[src], h_conn[dst]], dim=2)  # [num_edges, 2*(out_dim+connection_decoder_out_dim)]
+        edge_joint_type_feats = torch.cat([h_joint_type[src], h_joint_type[dst]], dim=2)  # [num_edges, 2*(out_dim+joint_type_decoder_out_dim)]
         # edge_motion_feats = torch.cat([h_motion[src], h_motion[dst]], dim=2)  # [num_edges, P, 2*motion_decoder_out_dim]
         edge_motion_feats = torch.cat([h_motion[src], h_motion[dst]], dim=1)  # [num_edges, 2P, motion_decoder_out_dim]
         # Predict edge connection (binary)
         edge_pred = self.part_conn_mlp(edge_conn_feats)  # [num_edges, P, 1]
         # Predict joint type (binary)
-        joint_type_pred = self.joint_type_mlp(edge_conn_feats)  # [num_edges, P, 1]
+        joint_type_pred = self.joint_type_mlp(edge_joint_type_feats)  # [num_edges, P, 1]
         # Predict motion parameters for revolute joints
         revolute_para_pred = self.revolute_mlp2(edge_motion_feats) # [num_edges, P, 8]
         # Predict motion parameters for prismatic joints
